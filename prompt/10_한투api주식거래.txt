@@ -1,0 +1,65 @@
+한국투자증권(KIS) 국내주식 API로 매수/매도와 익절/손절을 구현한다. 모의투자(KIS_USE_MOCK=true) 우선.
+
+[KIS 토큰 관리]
+- services/auth_service.py: 메모리 캐시 → DB(access_tokens 테이블) → 만료 시 /oauth2/tokenP 갱신.
+  KIS는 토큰 발급이 1분당 1회 제한이므로 Lock으로 직렬화하고 대기.
+
+[KIS 국내주식 엔드포인트 / TR_ID — 작성 시점 기준값. 구현 직전 KIS 공식 문서로 반드시 재검증]
+- 매수/매도(현금): /uapi/domestic-stock/v1/trading/order-cash
+    매수: 실전 TTTC0802U / 모의 VTTC0802U,  매도: 실전 TTTC0801U / 모의 VTTC0801U
+- 잔고조회:   /uapi/domestic-stock/v1/trading/inquire-balance       (실전 TTTC8434R / 모의 VTTC8434R)
+- 매수가능조회: /uapi/domestic-stock/v1/trading/inquire-psbl-order   (실전 TTTC8908R / 모의 VTTC8908R)
+- 현재가:     /uapi/domestic-stock/v1/quotations/inquire-price       (FHKST01010100)
+- 기간별 일봉: /uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice (FHKST03010100)
+- 일별 체결조회: /uapi/domestic-stock/v1/trading/inquire-daily-ccld   (실전 TTTC8001R / 모의 VTTC8001R)
+
+[매수 실행]
+- services/balance_service.py + 매수 함수:
+  - 잔고조회로 이미 보유/주문중인 종목 set 만들어 중복 매수 방지.
+  - 매수가능금액 조회 → 종목당 가용자금의 10%씩 분배.
+  - 한국 주문 규칙: 수량은 정수 주(소수점 불가), 지정가는 호가단위로 반올림, 상·하한가(±30%) 체크.
+  - 주문 성공 시 trade_records 테이블에 INSERT(status=buy_ordered). 주문 후에는 테이블에 우선 INSERT하고, 주문이 완료되서 종목을 보유하면 holding으로 update해줘.
+  - ATR 기반 익절가/손절가 계산해 저장(KRW). 배수는 core/config.py 로 외부화(매직넘버 금지):
+       take_profit = buy_price + ATR × TP_ATR_MULT   (기본 4.0)
+       stop_loss   = buy_price - ATR × SL_ATR_MULT   (기본 2.5)
+    · 배수 근거: 일봉 ATR 기준이라 14일 스윙 보유엔 손절이 타이트하면 휩쏘로 조기손절된다.
+      손익비 R:R≈1.6(손익분기 승률 ~38%). ★ 이 시작값은 평시/상승/횡보장 분리 백테스트로 확정해야 하며,
+      확정 전 실전 전환 금지(CLAUDE.md §2.4).
+    · ATR 계산 실패 시: 임의 고정비율 폴백을 쓰지 말 것(역R:R·fail-open 위험). NULL 저장 후
+      매도 사이클에서 buy_date 기준 ATR 백필을 강제하고, 백필도 실패하면 그 포지션은
+      '리스크 미관리'로 플래그해 다음 영업일 시장가 청산 후보로 둔다(fail-close).
+
+[매도 실행 — 장중 1분 주기로 호출될 함수]
+- 임계·계수는 전부 core/config.py 로 외부화(SELL_RSI_OVERBOUGHT, PANIC_VOL_MULT, PANIC_DROP_PCT,
+  SELL_FLOW_BAD, SELL_SIGNAL_THRESHOLD, TIME_STOP_DAYS 등). 아래 숫자는 자의적 시작값(백테스트 보정).
+- 매도 트리거(OR):
+  · ATR 익절/손절 도달. **손절은 반드시 시장가 청산**(지정가 금지 — 갭다운 시 손절가를 뚫고 미체결되어
+    손실 확대). 익절도 갭업 미체결 방지를 위해 시장가 또는 공격적 지정가.
+  · 장중 1분 주기로 현재 가격을 조회해서 익절/손절가에 도달한지 확인 후 매도한다.
+  · 시간 청산(time-stop): 매수 후 TIME_STOP_DAYS(기본 14~20영업일) 경과 시 TP/SL 미도달이어도 시장가 청산
+    (ML 예측 유효기간 만료).
+  · 기술적 매도신호 카운트: ① 데드크로스(SMA20<SMA60 — 매수 골든크로스와 SMA_LONG 통일) ② RSI>SELL_RSI_OVERBOUGHT(기본 82)
+    ③ MACD<Signal ④ 패닉셀(거래량 PANIC_VOL_MULT배 이상 + 당일 PANIC_DROP_PCT 이하)
+  · 임계: 신호 SELL_SIGNAL_THRESHOLD(기본 3)개 이상 매도 / 신호 2개 이상 + flow_score < SELL_FLOW_BAD(기본 -0.15) 매도 /
+- 매도 성공 시 trade_records UPDATE(status=sold, sell_price/date/reason, profit_loss, profit_loss_pct).
+
+[자가복구 & 정합성]
+- ATR 백필: take_profit/stop_loss가 NULL인 보유종목은 매도 사이클에서 자동 복구하되,
+  ★ 반드시 매수일자(buy_date) 기준 일봉으로 ATR을 계산한다(호출 시점 ATR 사용 금지).
+- _reconcile_orders: KIS 잔고 ↔ trade_records 정합성 동기화. 미체결 처리, 체결 시 상태전이,
+  KIS엔 있는데 DB에 없는 고아 종목은 자동 INSERT(status=holding).
+
+[trade_records 상태]
+- buy_ordered → (체결) holding → (매도신호) sell_ordered → (체결) sold / (미체결) buy_failed
+
+[완료 기준]
+- 모의투자 계좌로 1종목 지정가 매수 → 체결 확인 → 매도까지 상태전이 동작
+- TP/SL이 KRW로 저장(배수는 config: TP×4.0/SL×2.5)되고, ATR 백필이 buy_date 기준으로 동작
+- 손절이 시장가로 청산되고(지정가 아님), 동시 트리거 시 손절 우선, time-stop(예측 만료) 동작
+- 매도 시장변동성 가중이 VKOSPI가 아닌 VIX[T-1](당일 제외)로 동작
+- 호가단위 반올림/±30% 제한이 반영됨
+- 매도 임계·배수가 전부 config 로 외부화됨(매직넘버 없음)
+
+[검증]
+- stock-quant로 매도 트리거 규칙과 ATR 배수의 타당성(휩쏘·손익비·VIX 게이트)을, backend-reviewer로
+  주문 멱등성/중복방지/KIS 에러처리/손절 시장가 체결을 리뷰해줘.

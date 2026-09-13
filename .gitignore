@@ -1,0 +1,58 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── 가상환경 ────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── 환경변수 / 시크릿 (절대 커밋 금지) ──────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+# Kaggle push 시 ml_trigger 가 SUPABASE 시크릿을 주입해 생성 → 커밋 금지(predict.py 가 원본).
+# 파일명은 code_file(=<슬러그>.ipynb) 을 따르므로 폴더 내 모든 .ipynb 를 무시한다.
+kaggle_notebook/*.ipynb
+
+# ── ML 가중치 (Kaggle 산출물, 대용량) ───────────────────
+ml/weights/
+weights/
+*.pt
+*.pth
+*.pkl
+
+# ── 로그 / 캐시 ─────────────────────────────────────────
+logs/
+*.log
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── IDE / OS ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 데이터 덤프 (로컬 임시) ─────────────────────────────
+*.csv
+*.parquet
+data/
+
+# 피피티, 마케팅 폴더
+ppt/
+marketing/

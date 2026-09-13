@@ -1,0 +1,37 @@
+이제 프로젝트 초기 셋팅을 한다. 앞서 만든 ARCHITECTURE.md의 폴더 구조를 따른다.
+
+[할 일]
+1. 버전관리/환경:
+   - git 저장소 초기화(.gitignore: venv, __pycache__, .env, *.pyc 등 포함)
+   - Python 가상환경(venv) 생성 안내 및 requirements.txt 작성:
+     fastapi, uvicorn, pydantic, pydantic-settings, python-dotenv, supabase,
+     pandas, numpy, requests, pykrx, finance-datareader, apscheduler, anthropic
+   - README.md: 프로젝트 소개 + 설치/실행법(python run.py) + 단계별 로드맵 요약
+2. 폴더/파일 골격(레이어드 구조):
+   - run.py (uvicorn 진입점: app.main:app, host 0.0.0.0, port 8000, reload)
+   - app/main.py (FastAPI 앱 + lifespan: 시작 시 로그 남기고, 추후 스케줄러/초기수집 연결 자리 마련)
+   - app/core/config.py (pydantic-settings로 .env 로딩하는 Settings 클래스)
+   - app/db/supabase.py (Supabase 클라이언트 초기화)
+   - app/api/api.py (라우터 통합) + app/api/routes/ (health.py 등)
+   - app/services/ , app/utils/ (빈 패키지, __init__.py)
+3. 환경변수 설계 — .env.example 작성(값은 비우고 키만):
+   - KIS_BASE_URL, KIS_REAL_URL, KIS_APPKEY, KIS_APPSECRET, KIS_CANO, KIS_ACNT_PRDT_CD, KIS_USE_MOCK
+   - SUPABASE_URL, SUPABASE_KEY
+   - ECOS_API_KEY (한국은행), FRED_API_KEY (미국 거시 일부)
+   - ANTHROPIC_API_KEY, SLACK_WEBHOOK_URL
+   - KAGGLE_USERNAME, KAGGLE_API_TOKEN, KAGGLE_KERNEL_SLUG (ML용, 나중에 사용)
+   - USE_SCORING_V2=true
+4. 동작 확인용 엔드포인트:
+   - GET /health → {"status":"ok"} 반환
+   - GET / → 간단한 안내 메시지
+
+[완료 기준]
+- venv에 의존성 설치 후 `python run.py` 로 서버가 뜨고, http://localhost:8000/health 가 200 OK
+- 폴더 구조가 ARCHITECTURE.md와 일치
+- .env.example이 있고 .env는 .gitignore로 제외됨
+
+[참고: 내가 채울 값]
+- 실제 .env는 내가 직접 만들어서 KIS/Supabase/ECOS/Anthropic 키를 넣겠다. 너는 .env.example만 만들어라.
+
+[리뷰]
+- 골격을 다 만든 뒤 backend-reviewer 에이전트로 구조/시크릿 처리/.gitignore를 점검해줘.

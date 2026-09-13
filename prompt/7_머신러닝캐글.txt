@@ -1,0 +1,34 @@
+한국 25종목의 가격을 예측하는 ML 파이프라인을 만든다. 학습은 Kaggle GPU에서 한다.
+참고로 kaggle_notebook 폴더 하위에 predict.py 코드는 미국주식 ML 코드로 사용하던 코드야. 당연히 현재도 정상 작동하고있어.
+위 코드의 로직을 그대로 사용하고, 종목만 현재 우리의 한국 주식 종목으로 변경해줘. 다른 부분은 변경하지말고.
+stock_analysis_results, predicted_stocks 테이블을 만들어야 될거야. ddl 스크립트는 sql 폴더 하위에 만들어줘.
+
+[모델 사양]
+- 입력 2개(멀티모달): ① 과거 90일 × 25종목 종가  ② 과거 90일 × 거시/지수/환율 피처
+- 구조: 각 입력을 4겹 Transformer Encoder(MultiHeadAttention + Residual + LayerNorm + FFN)로 처리 →
+  각 Dense(64) → 두 흐름 Add → Dense(128) → Dropout(0.2) → GlobalAveragePooling1D → Dense(25)
+- 하이퍼파라미터: LOOKBACK=90, FORECAST_HORIZON=14, EPOCHS=50, BATCH_SIZE=32, LR=0.0001,
+  num_heads=8, ff_dim=256
+- 데이터: Supabase market_data 전체 로드(페이지네이션 1000행 단위) → ffill → MinMaxScaler
+  (종목용/거시용 스케일러 분리) → 슬라이딩 윈도우로 학습셋 생성
+- 개선사항(기존 흔한 실수 방지): validation_split=0.2, 랜덤시드 고정, EarlyStopping 적용
+
+[출력 & 저장]
+- 마지막 시점 기준 14일 후 예측가를 역변환(inverse_transform)으로 실제 가격 복원
+- 종목별 "예측 변동률(%)" = (예측가 - 현재가) / 현재가 × 100  계산
+  ※ 이름이 변동률(%)이지 확률이 아님. 이후 LLM 프롬프트에서도 "예측 상승률 +X.XX%"로 라벨링.
+- stock_analysis_results 테이블에 저장: Stock(종목명), Accuracy(%)=100-MAPE,
+  Last Actual Price, Predicted Future Price, Predicted Rise(bool), Rise Probability(%),
+  Recommendation(STRONG BUY / BUY / SELL), Analysis(간단 설명)
+- (선택) predicted_stocks 테이블에 일자별 예측가/실제가 저장(시각화용)
+- 참고로 Rise Probability(%) 컬럼은 14일 후 몇 % 등락할지를 저장하는 컬럼이야.
+
+[Kaggle 연동]
+- kaggle_notebook/ 에 학습 노트북(predict.ipynb) 작성. Kaggle Secrets로 SUPABASE_URL/KEY 주입.
+- services/ml_trigger_service.py: Kaggle CLI(kernels push)로 노트북을 트리거하고
+  상태를 폴링(queued→running→complete)하는 함수. KAGGLE_* 환경변수 사용.
+- README에 Kaggle 첫 셋업 주의: GPU/Internet 토글 ON, Secrets 등록, 휴대폰 인증 필요.
+
+[완료 기준]
+- Kaggle에서 노트북이 한국 데이터로 학습 → stock_analysis_results에 25종목 예측결과 저장
+- 로컬에서 ml_trigger_service로 Kaggle 인증 확인(auth-check) 가능

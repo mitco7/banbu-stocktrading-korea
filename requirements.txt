@@ -1,0 +1,34 @@
+# ── Web / API ───────────────────────────────────────────
+fastapi
+uvicorn[standard]
+
+# ── 설정 / 검증 ─────────────────────────────────────────
+pydantic
+pydantic-settings
+python-dotenv
+
+# ── DB (Supabase / PostgreSQL) ──────────────────────────
+supabase
+
+# ── 데이터 처리 ─────────────────────────────────────────
+pandas
+numpy
+
+# ── 외부 API / 시장 데이터 ──────────────────────────────
+requests
+pykrx
+finance-datareader
+yfinance
+# 수급 수집(flow_service)의 pd.read_html 이 요구 — 전이 의존에 기대지 말고 명시(배포 필수).
+lxml
+beautifulsoup4
+
+# ── 스케줄러 ────────────────────────────────────────────
+apscheduler
+
+# ── LLM (Claude 검토 레이어) ────────────────────────────
+anthropic
+
+# ── ML 트리거 (Kaggle CLI) ──────────────────────────────
+# 2.x = KGAT_ 액세스 토큰 기반 신형 CLI. push 성공 시에도 rc=0 이라 서비스단에서 stdout 파싱.
+kaggle>=2.2.1

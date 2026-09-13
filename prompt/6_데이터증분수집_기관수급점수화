@@ -1,0 +1,38 @@
+매일 데이터를 증분 수집하는 기능과, 외국인·기관 수급(순매수)을 점수화하는 기능을 만든다.
+
+[할 일 — 증분 수집]
+기존에 데이터 수집 방식은 .\venv\Scripts\python.exe scripts\backfill.py --start 2026-05-30 --end 2026-06-05
+이러한 방식으로 코드를 실행해서 수동으로 수집했어.
+앞으로는 아래와 같이 수집해줘. 
+두 기능(데이터수집, 외국인기관수급) 다 컨트롤러에 추가도 해줘.
+
+1. services/market_data_service.py 에 추가:
+   - get_last_updated_date(): market_data의 마지막 날짜 조회(없으면 백필 시작일 폴백).
+     ※ RLS로 빈 응답이 오면 과거부터 재수집되는 사고가 나니, 빈 응답과 진짜 빈 DB를 구분하라.
+   - update_market_data(force=False): 마지막 날짜+1 ~ 어제까지 수집해 저장.
+   - 장중 스킵: 한국 정규장(KST 09:00~15:30)에는 당일 종가가 미확정이므로 당일 수집을 건너뜀
+     (force=True면 무시). 저장 시 빈 컬럼은 직전 행 값으로 ffill.
+   - 기본적으로 서비스가 시작 될 때 market_data 테이블 조회해서 날짜 컬럼에 마지막 날짜를 기준으로 해당 행에서
+   모든 필드의 값이 채워넣어져 있으면 스킵하면되고, 특정 행이 비어있으면 그 날짜부터 어제까지 수집하면 되.
+
+[할 일 — 수급(뉴스감성 대체)]
+2. services/flow_service.py 신규:
+   - pykrx의 투자자별 순매수 데이터(예: get_market_net_purchases_of_equities 류)로
+     종목별 외국인 순매수 + 기관 순매수(금액 기준)를 최근 N거래일(기본 5일) 합산.
+   - 수급 점수 산출:
+       flow_raw = 외국인 순매수 + 기관 순매수
+       (종목 간 비교를 위해 거래대금 대비 비율로 정규화한 뒤)
+       flow_score 를 -1 ~ +1 범위로 만든다. (양수 = 매수 우위 = 호재성, 음수 = 매도 우위 = 악재성)
+   - 결과를 테이블 investor_flow 에 스냅샷 저장(매 실행 시 갱신):
+       컬럼: ticker, foreign_net, institution_net, flow_score, lookback_days, calculation_date
+       테이블 ddl 스크립트도 만들어줘.
+3. flow_score는 이후 단계에서 "감성 점수 자리"로 그대로 쓰인다(범위 -1~+1, 부호 의미 동일).
+
+[검증]
+- 수급 점수화 방식이 타당한지 stock-quant 에이전트로 점검해줘(정규화 방식, lookback 기간 등).
+
+[완료 기준]
+- update_market_data() 가 어제까지 빠진 날짜를 채움(여러 번 돌려도 중복 없음)
+- flow_service가 25종목의 flow_score(-1~+1)를 investor_flow에 저장
+- 한두 종목을 골라, 최근 외국인·기관이 순매수면 flow_score가 양수인지 수동 확인
+

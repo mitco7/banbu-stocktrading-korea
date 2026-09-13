@@ -1,0 +1,36 @@
+기술적 지표를 계산하고 수급 팩터와 결합해, 매수 후보 데이터를 만든다.
+- 참고로, 주말, 공휴일 데이터는 반드시 제외하고 데이터를 처리해야되.
+
+[기술적 지표 — market_data의 종가/거래량으로 계산]
+- SMA: 20일/50일 단순이동평균. 골든크로스 = SMA20 > SMA50.
+- RSI(14, Wilder 방식): gain/loss를 ewm(alpha=1/14)로 평활. 단, ffill로 채워진 "변동 0"인 날은
+  제외하고 계산(가짜 거래일이 RSI를 50으로 수렴시키는 문제 방지).
+- MACD(12, 26, 9): EMA12 - EMA26, signal = EMA9(MACD). 매수신호 = MACD > Signal.
+- ATR(14, Wilder): True Range의 14일 Wilder 평활.
+- ADX(14, Wilder): +DI/-DI → DX → 14일 Wilder 평활.
+- 거래량비율 = 오늘 거래량 / 직전 5거래일 평균 거래량 (주말/거래정지일 등 0 거래량 필터링).
+
+[수급 팩터 결합]
+- 앞 단계 investor_flow의 flow_score(-1~+1)를 종목별로 합쳐, 기존 "감성 점수 자리"로 사용.
+
+[후보 저장]
+- services/recommendation_service.py 작성:
+  - ML 예측(stock_analysis_results)에서 Rise Probability(%) >= 3 인 종목을 1차 후보로.
+  - 각 후보에 대해 위 기술적 지표 + 거래량비율 + flow_score를 계산/결합.
+  - stock_recommendations 테이블에 저장(종목, 각 지표값, flow_score, 골든크로스/RSI/MACD 신호 등).
+    - stock_recommendations 테이블에는 추천 된 종목에 대해 판단 근거로 사용한 최대한 많은 데이터를 넣어야되.
+    - 첫번째 컬럼으로 날짜를 넣어줘. 날짜별로 오늘은 어떤 종목이 추천되었는지 기록할 필요가 있어. 그래야 나중에 추적이되.  
+
+[한국 시장 특수사항 — 메모만 남기고 주문 단계에서 사용]
+- 가격제한폭 ±30%(상/하한가), 호가단위(가격대별로 다름)는 KIS 매매 단계(프롬프트 10)에서 처리.
+
+[하지 말 것]
+- 종합점수 가중합과 LLM 검토는 다음 단계. 여기서는 지표 계산 + 후보 저장까지만.
+
+[완료 기준]
+- 25종목(또는 1차 통과 종목)에 대해 SMA/RSI/MACD/ATR/ADX/거래량비율/flow_score/Rise Probability(%)가 계산되어
+  stock_recommendations 테이블에 저장됨
+- 한 종목의 SMA/RSI/MACD/ATR/ADX 값을 네이버금융 등 외부 차트와 대략 대조해 비슷한지 확인
+
+[검증]
+- stock-quant 에이전트로 지표 공식(특히 RSI Wilder, ATR/ADX)이 표준과 일치하는지 검증해줘.

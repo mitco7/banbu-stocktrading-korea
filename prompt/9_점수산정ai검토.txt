@@ -1,0 +1,148 @@
+매수 후보에 "종합점수"를 매기고, 마지막에 Claude(LLM)가 거부권으로 최종 검토하는 단계를 만들어줘.
+services/scoring_service.py 를 새로 만들면 된다.
+
+시작 전에 두 가지를 분명히 하자.
+
+(1) 우리 시스템엔 VKOSPI가 없다. 무료 소스가 없어서 2026-05에 market_data 컬럼에서 완전히 제거했고, 
+시장 변동성 게이지는 VIX로 대체했다. 그러니 VKOSPI 기반 설계는 절대 하지 말고, 
+시장 변동성은 market_data의 "VIX 지수" 컬럼으로만 처리해.
+
+(2) 우리는 이미 계산해서 DB에 저장해놓고 점수에 안 쓰던 좋은 데이터가 있다. 이번엔 그걸 최대한 활용한다. 특히:
+  - stock_recommendations의 plus_di/minus_di (추세 "방향") — adx만 쓰고 방향은 버리고 있었다.
+  - foreign_net / institution_net (외국인·기관 따로) — flow_score로 합쳐버려서 "둘의 합치도"를 못 보고 있었다.
+단, 다 욱여넣으면 자유 파라미터가 폭증해 과최적화가 난다. 그래서 "점수에 넣을 것 / 게이트로만 둘 것 / 아예 뺄 것"을 아래처럼 구분했다. 이 구분을 지켜라.
+
+
+[먼저 — 점수 매기기 전에 거르는 하드필터 (fail-close가 기본)]
+
+아래 해당 종목은 점수 계산 전에 후보에서 제외한다(점수로 되살리지 않는다):
+  - ml_recommendation == "SELL". (상승률 3% 넘어도 ML이 SELL이라고 한 모순 케이스. ml_sub만 보고 무시 금지.)
+  - flow_score == None (수급 데이터 없음). None을 중립 0.5로 치환하는 건 "정보 없음"을 "중립"으로 미화하는 누수다. 절대 치환하지 말고 제외.
+  - RSI > RSI_HARD_MAX (config, 시작값 82). 극과열 추격 금지.
+  - 이격도 ext20 = (close - sma20)/sma20 > EXT20_MAX (config, 시작값 0.25). 20일선 위 25% 이상이면 단기 과열·갭다운 위험 → 추격매수 차단.
+  - atr_pct > ATR_PCT_MAX (config, 시작값 20). 극단 변동성(거래정지 복귀·이벤트 종목) 제외.
+  - 기술 사전필터: (골든크로스 / RSI 매수권 / MACD 매수) 중 2개 이상 충족 못 하면 제외.
+
+그리고 점수에 들어가는 세 신호의 "기준일"이 어긋나지 않는지 확인해라. ML 예측이 만들어진 기준일(as-of), 지표 indicator_date, 수급 calculation_date 
+이 셋이 며칠씩 어긋난 채 한 점수로 합쳐지면, ML이 며칠 전 가격 기준이고 그새 이미 그만큼 올랐을 때 "이미 실현된 상승"을 "미래 상승"으로 오인해 고점에 산다. 
+세 기준일을 로그에 같이 남기고, 최대 격차가 임계(config, 예: 2영업일)를 넘으면 그 종목은 fail-close.
+
+
+[종합점수 — 풀 크기에 안 흔들리는 절대·유계 가중합]
+
+예전처럼 후보들끼리 횡단면 z-score 하지 마라. 우리 하루 후보는 보통 2~5종목인데, 2개짜리 표본을 표준화하면 항상 ±0.707로 고정돼 통계적으로 무의미하고, 
+"다 같이 약한 날에도 1등은 만들어지는" 함정에 빠진다.
+
+대신 각 팩터를 0~1 절대 서브스코어로 변환해 가중합한다. 가중치는 합이 1.0이 되게 하고, 전부 core/config.py로 빼라(하드코딩 금지).
+
+  종합점수 = W_ML*ml_sub + W_TECH*tech_sub + W_FLOW*flow_sub + W_VOL*vol_sub
+  시작 가중치: W_ML=0.30, W_TECH=0.30, W_FLOW=0.25, W_VOL=0.15  (합=1.0)
+
+── 1) ml_sub (ML 모멘텀, 0~1) ────────────────────────────────────────
+ML 예측 상승률을 saturating 변환해서 그대로 쓴다.
+
+  ml_sub = clip(predicted_rise_pct, 0, ML_RISE_CAP) / ML_RISE_CAP        # ML_RISE_CAP=15
+
+후보는 이미 3% 이상이라 실효 구간은 [3%,15%] → [0.2,1.0]. 14일 +15% 이상은 만점이자 과적합 의심 구간이라 saturate.
+
+── 2) tech_sub (기술적 신호, 0~1) ────────────────────────────────────
+이미 종목 간 비교 가능한 신호만 쓴다. MACD 원시값(원화 절대값)은 가격대마다 스케일이 달라서 점수에 직접 넣지 말고 macd_buy 불리언으로만 쓴다.
+
+  gc_pt   = golden_cross ? 1 : 0
+  macd_pt = macd_buy ? 1 : 0
+  rsi_pt  = RSI 건강도 (아래 매핑)
+  adx_pt  = clip(adx, 0, ADX_CAP) / ADX_CAP * direction_ok       # ADX_CAP=40
+
+  ★ direction_ok = (plus_di > minus_di) ? 1 : 0
+    → ADX는 추세 "세기"만 알고 "방향"은 모른다. +DI/-DI를 안 보면 강한 '하락'추세(-DI>+DI, ADX 높음)에 만점을 주는 버그가 난다. 
+    그래서 +DI>-DI(상승 방향)일 때만 추세 세기를 인정하고, 아니면 0. 
+    (DI를 별도 점수항으로 더하지 마라 — golden_cross/macd_buy가 이미 방향을 보고 있어서 방향신호 3중 카운트가 된다. DI는 ADX의 on/off 스위치로만.)
+
+  RSI 매핑(40~75 넓은 만점 — 상승추세 눌림목 진입은 좋은 자리로 보고, 딥 과매도와 극과열만 깎고 제외):
+    RSI <= 30       → 0.5  (딥 과매도 = '눌림목'이 아니라 떨어지는 칼날일 수 있어 주의)
+    30 ~ 40         → 0.5 → 1.0 선형 상승
+    40 ~ 75         → 1.0 (건강한 매수권 — 추세 눌림목 포함, 만점)
+    75 ~ 82         → 1.0 → 0.6 선형 감점 (과열 진입)
+    RSI > 82        → 위 하드필터에서 이미 제외됨
+    (구간 경계는 config: RSI_OVERSOLD_FLOOR=30, RSI_FULL_LO=40, RSI_FULL_HI=75, RSI_HARD_MAX=82.)
+    ※ RSI 40~50은 센터라인(50) 아래지만, 방향은 이미 골든크로스·MACD가 보고 RSI는 보조(가중 0.20)라
+      눌림목까지 만점으로 보는 게 추세추종에 맞다.
+
+  tech_sub = 0.30*gc_pt + 0.30*macd_pt + 0.20*rsi_pt + 0.20*adx_pt
+    (내부 가중도 config. 합 1.0. golden_cross/macd가 실질 추세신호라 무겁게, RSI/ADX는 보조.)
+
+── 3) flow_sub (수급 — 외국인/기관 합치도 반영, 0~1) ──────────────────
+flow_score는 외국인+기관을 합쳐 -1~+1로 만든 값인데, 이 합산이 "외국인 +100 / 기관 -100"(실제론 이견·불확실)을 0(중립)으로 뭉갠다. 그래서 원시 부호로 합치도를 본다.
+
+  flow_base = (flow_score + 1) / 2                              # -1~+1 → 0~1
+  agree     = (foreign_net 과 institution_net 의 부호가 같고, 둘 다 0 아님)
+  disagree  = (부호가 반대이고, 둘 다 0 아님)
+  flow_sub  = flow_base * CONFLUENCE_MULT   (disagree 일 때, CONFLUENCE_MULT=0.7)
+            = flow_base                     (그 외)
+
+  - 이견이면 신뢰도를 0.7배로 깎되 죽이지는 않는다(합산이 이미 한쪽으로 기울었으면 그 정보는 살림).
+  - "쌍끌이"(둘 다 순매수)는 점수에 +α를 주지 말고, dual_buy = (foreign_net>0 and institution_net>0) 플래그로 만들어 아래 LLM 검토에 근거로 넘겨라(파라미터 안 늘림).
+
+  ※ 수급 가중을 절대 낮게 주지 마라. 우리는 뉴스감성 API가 없어서 flow가 가격에서 안 나오는 유일한 독립 정보원이다(외국인·기관 실제 자금). 
+  ML도 기술지표도 결국 "가격 시계열" 하나에서 나오니, flow를 빼면 시스템이 사실상 가격 모멘텀 단일 팩터가 되어 고점 추격에 그대로 노출된다. 
+  외국인·기관이 순매도 중인데 가격·ML만 보고 사는 게 한국 시장 최대 함정이다.
+  (메모: 외국인이 기관보다 선행적이라는 통념이 있지만, 5일 합·연 몇 번뿐인 검증으로는 외국인/기관 가중 차등을 정당화 못 한다 → 지금은 confluence에서만 암묵 반영하고 명시 가중 차등은 보류.)
+
+── 4) vol_sub (거래량, 0~1) ──────────────────────────────────────────
+  vol_sub = clip(volume_ratio - 1, 0, VOL_RATIO_CAP - 1) / (VOL_RATIO_CAP - 1)   # VOL_RATIO_CAP=3
+  평소(1.0)면 0, 3배 이상이면 만점. 상단 cap이 중요하다 — 5~10배는 보통 악재 패닉·블록딜·지수 편출입 같은 단발 이벤트라 무한정 점수를 올리면 안 된다. 
+  5거래일 비율이라 노이즈가 커서 가중도 가장 낮게(0.10).
+
+
+[시장 변동성 게이트 — VKOSPI 대신 VIX, 반드시 t-1 shift]
+
+market_data "VIX 지수"로 보수모드 게이트를 만든다. 반드시 직전 영업일 값 VIX[T-1]을 명시적으로 shift(1)해서 읽어라. 
+한국 당일 아침에 알 수 있는 VIX는 전날 미국 종가 VIX다(미국 장이 한국 밤에 끝남). 
+"오늘 행의 VIX"를 그냥 읽으면 적재 방식에 따라 미국 당일값(한국 아침엔 아직 없는 값)을 읽어 look-ahead 누수가 난다.
+
+  VIX[T-1] < VIX_CAUTION (시작값 25)          → 정상
+  VIX_CAUTION ~ VIX_BLOCK (시작값 30)          → 매수 임계 상향(예: min_rise 3%→5%)
+  VIX[T-1] >= VIX_BLOCK                         → 신규 매수 전면 차단(보수모드)
+  VIX 결측이 ffill 1일 넘게 이어지면            → fail-close(보수모드 강제)
+
+주의: VIX(미국 S&P500 IV)와 VKOSPI는 레벨이 다르고 위기 시 한국이 더 크게 튄다. 
+VIX는 "글로벌 위험회피" 프록시일 뿐 한국 고유 변동성(지정학·환율)은 못 잡으니, 임계는 보수적으로 잡아도 된다(필요시 VIX_BLOCK을 28쯤). 
+종목별 변동성은 ATR 손절(다음 단계)이 담당한다.
+(SOX·원/달러·KOSPI 같은 다른 시장지표로 게이트를 더 만들지 마라. 
+SOX 반도체 틸트는 우리 반도체가 3종목뿐이라 표본부족 과최적화, 원/달러는 flow와 중복, KOSPI/SOX 레짐 게이트는 VIX 게이트와 중복이다.)
+
+
+[정렬 · tie-breaker]
+
+게이트 통과 종목만 종합점수 내림차순 정렬. 동점이 자주 날 수 있으니(불리언 신호가 많음) tie-breaker를 config로 명문화하고 결정적(deterministic)으로 — 멱등성 때문에 매번 같은 순서가 나와야 한다:
+  1순위 종합점수 큰 순 → 2순위 atr_pct 작은 순(변동성 낮은 종목 선호) → 3순위 predicted_rise_pct 큰 순 → 4순위 flow_score 큰 순 → 5순위 ticker 오름차순.
+
+
+[LLM 최종 검토]
+
+services/llm_review_service.py 를 만든다(Anthropic SDK, 프롬프트 캐싱 적용).
+  - 역할: "한국 주식 트레이딩 20년 경력의 최종 의사결정자". 거부권만 행사 — BUY를 HOLD로 내릴 수는 있어도, 후보에 없던 새 종목을 추가하거나 탈락 종목을 되살릴 수는 없다(코드 레벨에서도 차단).
+  - 입력: 통과 종목별로 ML 예측 상승률("+X.XX% 상승률"로 라벨링, 확률 아님), 기술적 지표, 거래량비율, ADX/+DI/-DI, 수급(flow_score, 외국인/기관 순매수, dual_buy 플래그), 종합점수, 현재 VIX[T-1], 가격은 전부 KRW.
+  - 검토 기준(한국 특화): 실적시즌/주요 공시, 선물·옵션 만기일(쿼드러플 위칭), 상·하한가 근접, 공매도 이슈, 동일 섹터 과집중, 원/달러 급변.
+  - 응답: JSON 강제 — {market_analysis, decisions:[{ticker, decision(BUY/HOLD), reason}]}
+  - 모델 폴백: ["claude-opus-4-8" → "claude-sonnet-4-6"], 각 3회 재시도(지수 백오프), 429/503/529 처리. opus-4-8엔 temperature 미전달, sonnet엔 temperature=0.
+  - Fail-Close: 모두 실패하거나 ANTHROPIC_API_KEY가 없거나 응답 파싱 실패·타임아웃 — 어떤 경우든 매수 차단이 기본값. Slack 알림(자리만 마련).
+  - 결과를 decision_logs 테이블에 upsert(키: decision_date + ticker).
+
+
+[완료 기준]
+- 후보에 0~1 절대 서브스코어 기반 종합점수가 계산된다(tech는 +DI/-DI 방향 가드, flow는 합치도 보정 반영).
+- SELL/수급결측/과매수/이격과열/극단변동성/기준일격차 종목이 점수 전에 fail-close로 빠진다.
+- VIX[T-1] 게이트로 보수모드 전환/매수차단이 동작한다.
+- (모의 데이터로) LLM이 BUY/HOLD JSON을 반환하고 decision_logs에 기록된다. LLM 전체 실패 시 매수 차단 확인.
+- 신규 파라미터가 전부 core/config.py에 외부화: W_ML/W_TECH/W_FLOW/W_VOL, tech 내부가중, ML_RISE_CAP, ADX_CAP, VOL_RATIO_CAP, RSI_OVERSOLD_FLOOR/RSI_FULL_LO/RSI_FULL_HI/RSI_HARD_MAX, CONFLUENCE_MULT, EXT20_MAX, ATR_PCT_MAX, VIX_CAUTION/VIX_BLOCK, 기준일 격차 임계, tie-breaker. 전부 "자의적 도메인 시작값, 백테스트로 보정 필요"라고 주석.
+
+
+[검증]
+- stock-quant로 서브스코어 변환식·가중치·VIX 게이트의 타당성과 look-ahead 여부 재점검. 검증 시 후보 풀의 atr_pct 분포도 확인해라 — atr tie-breaker가 저변동주를 미세하게 밀어올리니, 후보가 SK텔레콤·삼성물산 같은 저변동주로 쏠리면 tie-breaker 순서를 조정해야 한다.
+- backend-reviewer로 LLM 호출의 재시도·폴백·fail-close 견고성과 하드필터(SELL/결측/이격/기준일) 누락 여부 리뷰.
+- 신규 임계 3개(CONFLUENCE_MULT/EXT20_MAX/ATR_PCT_MAX) + 가중/cap이 전부 자의적 시작값이므로, 모의투자로 민감도(특히 EXT20_MAX·CONFLUENCE_MULT·RSI 상단)를 확인하기 전엔 실전 전환 금지(CLAUDE.md §2.4).
+
+
+[다음 스텝 부채 메모]
+- 종목별 "거래대금"이 flow_service 내부에서 계산되고 버려진다(recommendation에 저장 안 됨). tie-breaker를 거래대금 기준으로 강화하거나 수급을 종목별 rolling z-score로 고도화하려면, 거래대금을 stock_recommendations에 저장해두는 게 좋다. 이번 점수 설계엔 불필요하니 부채로만 기록.
