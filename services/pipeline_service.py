@@ -193,26 +193,113 @@ def _collect_summary(market_result: dict, flow_result: dict) -> str:
     return f"{market_line}\n{flow_line}"
 
 
+# VIX 게이트 국면 → 사람이 읽는 설명(알림용).
+_REGIME_LABEL = {
+    "normal": "평시 — 신규 매수 허용",
+    "caution": "주의 — 매수 기준 강화(최소 예측상승률 상향)",
+    "blocked": "차단 — 신규 매수 중단(보수 모드)",
+}
+
+
+def _clip(text, limit: int) -> str:
+    """알림용 한 줄 축약(개행·연속 공백 제거 후 limit 자 초과분 말줄임)."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _eok(v) -> str:
+    """원 → 억/조 표기(부호 포함). 수급 순매수액 알림용."""
+    if not isinstance(v, (int, float)):
+        return "-"
+    if abs(v) >= 1e12:
+        return f"{v / 1e12:+,.1f}조"
+    return f"{v / 1e8:+,.0f}억"
+
+
+def _stock_block(idx: int, s: dict) -> str:
+    """BUY 종목 1건 — 예상 매매가와 판단 근거(ML·수급·점수·AI 검토)를 묶은 블록."""
+    ml = s.get("ml_prediction") or {}
+    fl = s.get("investor_flow") or {}
+    ind = s.get("technical_indicators") or {}
+    sc = s.get("scores") or {}
+    lines = [f"*{idx}. {s.get('name')}({s.get('ticker')})*"]
+
+    # 얼마에 사서 얼마에 파는가 — 전일 종가 기준 예상 목표/손절가(확정은 체결가 기준).
+    base, atr = ml.get("last_actual_price"), ind.get("atr")
+    if isinstance(base, (int, float)) and isinstance(atr, (int, float)) and base > 0 and atr > 0:
+        tp = base + atr * settings.TP_ATR_MULT
+        sl = base - atr * settings.SL_ATR_MULT
+        lines.append(
+            f"기준가 {base:,.0f}원(전일 종가) → 목표 {tp:,.0f}원({(tp / base - 1) * 100:+.1f}%) · "
+            f"손절 {sl:,.0f}원({(sl / base - 1) * 100:+.1f}%)"
+        )
+    rise, future = ml.get("predicted_rise_pct"), ml.get("predicted_future_price")
+    if isinstance(rise, (int, float)):
+        future_txt = f" {future:,.0f}원" if isinstance(future, (int, float)) else ""
+        lines.append(f"ML 예측: 14일 후{future_txt} ({rise:+.2f}%)")
+    f_net, i_net = fl.get("foreign_net"), fl.get("institution_net")
+    if f_net is not None or i_net is not None:
+        dual = " · 쌍끌이(외국인+기관 동반 순매수)" if sc.get("dual_buy") else ""
+        lines.append(f"수급(최근 {settings.FLOW_LOOKBACK_DAYS}거래일): "
+                     f"외국인 {_eok(f_net)} · 기관 {_eok(i_net)}{dual}")
+    total = sc.get("total_score")
+    if isinstance(total, (int, float)):
+        subs = " · ".join(
+            f"{label} {sc[k]:.2f}"
+            for k, label in (("ml_sub", "ML"), ("tech_sub", "기술"),
+                             ("flow_sub", "수급"), ("vol_sub", "변동성"))
+            if isinstance(sc.get(k), (int, float))
+        )
+        lines.append(f"종합점수 {total:.3f}" + (f" ({subs})" if subs else ""))
+    if s.get("reason"):
+        lines.append(f"AI 검토: {_clip(s['reason'], 220)}")
+    return "\n".join(lines)
+
+
 def _buy_summary(details: dict, decision_result: dict, market_blocked: bool) -> str:
-    """5단계 최종 매수 결정(BUY 목록)을 Slack 1건용 요약으로 압축."""
+    """5단계 최종 매수 결정(BUY 목록)을 근거·예상 매매가까지 담아 Slack 1건으로 요약."""
     lines: list[str] = []
+
+    # 시장 컨텍스트 — VIX 게이트 판정과 AI 시장 분석을 사람이 읽는 문장으로.
+    vix, regime = decision_result.get("vix_t1"), decision_result.get("regime")
+    if vix is not None or regime is not None:  # no_candidates 경로는 게이트 미평가 → 줄 생략
+        vix_txt = f"{vix:.2f}" if isinstance(vix, (int, float)) else "-"
+        lines.append(f"시장 상태: VIX(전일 종가) {vix_txt} · {_REGIME_LABEL.get(regime, regime or '-')}")
+    if details.get("llm_market_analysis"):
+        lines.append(f"AI 시장 분석: {_clip(details['llm_market_analysis'], 300)}")
+
     if details.get("buy") is None:
         # 상세 병합 실패 폴백 — '없음'으로 단언하면 제목의 N종목과 모순되므로 구분 표기.
         lines.append(f"종목 상세 조회 실패 — 매수 {decision_result.get('buys', 0)}종목은 "
                      "decision_logs 에서 확인 필요")
-    else:
-        for s in details["buy"].get("stocks") or []:
-            score = (s.get("scores") or {}).get("total_score")
-            rise = (s.get("ml_prediction") or {}).get("predicted_rise_pct")
-            score_txt = f"{score:.1f}" if isinstance(score, (int, float)) else "-"
-            rise_txt = f"{rise:+.2f}%" if isinstance(rise, (int, float)) else "-"
-            lines.append(f"• {s.get('name')}({s.get('ticker')}) — 종합점수 {score_txt}, 예측상승률 {rise_txt}")
-        if not lines:
-            lines.append("매수 종목 없음"
-                         + (" — VIX 임계 초과로 신규 매수 차단(보수 모드)" if market_blocked else ""))
-    vix, regime = decision_result.get("vix_t1"), decision_result.get("regime")
-    if vix is not None or regime is not None:  # no_candidates 경로는 게이트 미평가 → 줄 생략
-        lines.append(f"VIX[T-1]={'-' if vix is None else vix} regime={'-' if regime is None else regime}")
+        return "\n".join(lines)
+
+    stocks = details["buy"].get("stocks") or []
+    if not stocks:
+        lines.append("매수 종목 없음"
+                     + (" — VIX 임계 초과로 신규 매수 차단(보수 모드)" if market_blocked
+                        else " — 기준 통과 종목 없음(점수 미달·AI 보류)"))
+    for i, s in enumerate(stocks, 1):
+        lines.append("")
+        lines.append(_stock_block(i, s))
+
+    hold_cnt = (details.get("hold") or {}).get("count") or 0
+    nc_cnt = (details.get("non_candidates") or {}).get("count") or 0
+    rest: list[str] = []
+    if hold_cnt:
+        rest.append(f"HOLD {hold_cnt}종목(점수 미달·AI 보류 등)")
+    if nc_cnt:
+        rest.append(f"후보 제외 {nc_cnt}종목(예측상승률 미달)")
+    if rest:
+        lines.append("")
+        lines.append("그 외: " + " · ".join(rest))
+    if stocks:
+        lines.append(
+            f"※ 매수는 오늘 {settings.SCHEDULE_BUY_TIME} 시장가 집행. 목표·손절가는 전일 종가와 "
+            f"ATR(익절 ×{settings.TP_ATR_MULT:g} / 손절 ×{settings.SL_ATR_MULT:g}) 기준 예상치 — "
+            f"확정가는 체결가 기준으로 '매수 체결 확인' 알림에 담깁니다. "
+            f"{settings.TIME_STOP_DAYS}영업일 내 미도달 시 시간 청산."
+        )
     return "\n".join(lines)
 
 

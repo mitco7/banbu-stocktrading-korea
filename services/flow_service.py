@@ -12,7 +12,10 @@
     flow_score = tanh(ratio / FLOW_SCORE_SCALE)        (-1~+1 로 squash, 부호 보존)
 
 데이터 소스(FLOW_SOURCE):
-  - "naver"(기본): 네이버 금융 종목별 외국인/기관 일별 순매매(주식수)×종가로 금액 환산. **로그인 불필요.**
+  - "naver"(기본): 네이버 증권 신 JSON API(m.stock.naver.com)의 종목별 외국인/기관 일별
+    순매매(주식수)×종가로 금액 환산. **로그인 불필요.**
+    (구 finance.naver.com/item/frgn.naver HTML 표는 2026-09 stock.naver.com SPA 로
+     리다이렉트되어 파싱 불가 — "No tables found" — 가 되어 JSON API 로 교체.)
   - "pykrx": KRX 투자자별 순매수 — KRX 로그인(KRX_ID/KRX_PW) 필요(본 환경 차단).
   - "auto": naver 실패 시 pykrx 폴백.
   점수 산출 로직(compute_flow_score)은 소스와 무관한 순수 함수다.
@@ -43,12 +46,12 @@ KST = ZoneInfo("Asia/Seoul")
 _FOREIGN_COLS = ("외국인합계", "외국인")
 _INSTITUTION_COLS = ("기관합계", "기관")
 
-# 네이버 금융(로그인 불필요) — 종목별 외국인/기관 일별 순매매.
+# 네이버 증권 신 API(로그인 불필요) — 종목별 외국인/기관 일별 순매매(JSON).
 _NAVER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
-_NAVER_FRGN_URL = "https://finance.naver.com/item/frgn.naver?code={code}&page={page}"
+_NAVER_TREND_URL = "https://m.stock.naver.com/api/stock/{code}/trend?pageSize={size}&page={page}"
 
 
 def compute_flow_score(
@@ -80,59 +83,68 @@ def _pick_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
 
 
 @retry(attempts=2, base_delay=1.5, backoff=2.0)
-def _naver_get(url: str, code: str) -> str:
+def _naver_get_trend(code: str, size: int, page: int) -> list:
     r = requests.get(
-        url,
+        _NAVER_TREND_URL.format(code=code, size=size, page=page),
         headers={"User-Agent": _NAVER_UA,
-                 "Referer": f"https://finance.naver.com/item/frgn.naver?code={code}"},
+                 "Referer": f"https://m.stock.naver.com/domestic/stock/{code}/total"},
         timeout=10,
     )
     r.raise_for_status()
-    r.encoding = "euc-kr"
-    return r.text
+    data = r.json()
+    return data if isinstance(data, list) else []
 
 
-def _parse_naver_frgn(html: str) -> pd.DataFrame | None:
-    """네이버 외국인/기관 일별 표 파싱 → date/close/volume/inst_sh/foreign_sh(순매매 주식수).
+def _num(v) -> float | None:
+    """네이버 API 숫자 문자열('+1,234', '-56', '248,500') → float. 파싱 불가 시 None."""
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace(",", "").replace("+", ""))
+    except ValueError:
+        return None
 
-    표는 9컬럼(날짜·종가·전일비·등락률·거래량·기관 순매매량·외국인 순매매량·보유주수·보유율).
-    위치 기준으로 추출하고, 날짜가 유효한 표만 반환.
+
+def _parse_naver_trend(rows: list) -> pd.DataFrame | None:
+    """신 API 응답(list[dict]) → date/close/volume/inst_sh/foreign_sh(순매매 주식수).
+
+    행 필드: bizdate(YYYYMMDD)·closePrice·accumulatedTradingVolume·
+    organPureBuyQuant(기관)·foreignerPureBuyQuant(외국인) — 값은 부호·콤마 포함 문자열.
     """
-    for t in pd.read_html(io.StringIO(html)):
-        if t.shape[1] < 9:
-            continue
-        out = pd.DataFrame({
-            "date": pd.to_datetime(t.iloc[:, 0], format="%Y.%m.%d", errors="coerce"),
-            "close": pd.to_numeric(t.iloc[:, 1], errors="coerce"),
-            "volume": pd.to_numeric(t.iloc[:, 4], errors="coerce"),
-            "inst_sh": pd.to_numeric(t.iloc[:, 5], errors="coerce"),
-            "foreign_sh": pd.to_numeric(t.iloc[:, 6], errors="coerce"),
-        }).dropna(subset=["date", "close", "volume"])
-        if not out.empty:
-            return out
-    return None
+    if not rows:
+        return None
+    out = pd.DataFrame({
+        "date": pd.to_datetime([r.get("bizdate") for r in rows],
+                               format="%Y%m%d", errors="coerce"),
+        "close": [_num(r.get("closePrice")) for r in rows],
+        "volume": [_num(r.get("accumulatedTradingVolume")) for r in rows],
+        "inst_sh": [_num(r.get("organPureBuyQuant")) for r in rows],
+        "foreign_sh": [_num(r.get("foreignerPureBuyQuant")) for r in rows],
+    }).dropna(subset=["date", "close", "volume"])
+    return out if not out.empty else None
 
 
 def _fetch_flow_naver(
-    code: str, lookback: int
+    code: str, lookback: int, todate: str
 ) -> tuple[float, float, float, str] | None:
-    """네이버 금융으로 (외국인 순매수액, 기관 순매수액, 거래대금, 최근거래일) 반환. 빈/부족 시 None.
+    """네이버 신 API 로 (외국인 순매수액, 기관 순매수액, 거래대금, 최근거래일) 반환. 빈/부족 시 None.
 
     순매매량(주)×종가로 금액 환산(가격이 분자·분모에서 상쇄돼 비율은 정확). 로그인 불필요.
+    todate(기준일) 이후 행은 제외 — 장중 재실행 시 미확정 당일 데이터가 섞이지 않게(§2.1).
     """
-    pages = max(1, lookback // 8 + 1)
+    page_size = min(max(lookback + 10, 15), 60)
     frames: list[pd.DataFrame] = []
-    for page in range(1, pages + 1):
+    for page in range(1, 4):  # 기준일 필터로 부족할 때만 다음 페이지
         try:
-            html = _naver_get(_NAVER_FRGN_URL.format(code=code, page=page), code)
+            rows = _naver_get_trend(code, page_size, page)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("네이버 수급 요청 실패 %s p%d: %s", code, page, exc)
+            logger.warning("네이버 수급 API 실패 %s p%d: %s", code, page, exc)
             break
-        parsed = _parse_naver_frgn(html)
-        if parsed is None or parsed.empty:
+        parsed = _parse_naver_trend(rows)
+        if parsed is None:
             break
         frames.append(parsed)
-        if sum(len(f) for f in frames) >= lookback:
+        if sum(len(f) for f in frames) >= lookback + 5 or len(rows) < page_size:
             break
 
     if not frames:
@@ -143,6 +155,7 @@ def _fetch_flow_naver(
         .sort_values("date")
         .reset_index(drop=True)
     )
+    df = df[df["date"] <= pd.Timestamp(todate)]
     if len(df) < lookback:  # 거래일 부족(상장 직후 등) → fail-close
         return None
 
@@ -202,7 +215,7 @@ def _fetch_flow(
     """
     src = settings.FLOW_SOURCE
     if src in ("naver", "auto"):
-        res = _fetch_flow_naver(code, lookback)
+        res = _fetch_flow_naver(code, lookback, todate)
         if res is not None:
             return res
         if src == "naver":
