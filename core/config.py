@@ -12,6 +12,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # .env 는 CWD 가 아니라 프로젝트 루트 기준 절대경로로 찾는다.
@@ -214,9 +215,19 @@ class Settings(BaseSettings):
     PRICE_LIMIT_PCT: float = 0.30       # 상·하한가(±30%) — 지정가가 이 범위 벗어나면 거부
     # KIS API 호출 페이싱(초당 건수). 모의투자 공식 제한 2건/초 — 실전은 .env 로 상향 가능.
     KIS_RATE_LIMIT_PER_SEC: float = 2.0
-    # KIS HTTP 타임아웃(초). 모의서버가 장 후반(14:30~15:30) 10초 초과 응답하는 패턴 관측
+    # KIS HTTP 읽기 타임아웃(초). 모의서버가 장 후반(14:30~15:30) 10초 초과 응답하는 패턴 관측
     # (2026-09 운영) → 15초. 주문(POST)도 공유 — 타임아웃 시 KisOrderUncertainError 로 안전 처리.
     KIS_TIMEOUT_SEC: float = 15.0
+    # KIS 연결(TCP/TLS) 타임아웃(초) — 읽기와 분리. 정상 시 EC2→KIS 접속은 수 ms(실측 4ms)라
+    # 5초면 충분하다. 모의서버 장애일(2026-09-16·18)엔 접속 단계에서 15초씩 묶여 매도 사이클이 늘어졌다.
+    KIS_CONNECT_TIMEOUT_SEC: float = Field(5.0, gt=0)
+    # 매도 감시(1분 주기) 시세 조회의 총 시도 횟수(최초 포함). 60초 뒤 다음 사이클이 어차피
+    # 재확인하므로 레이트리밋(EGW00201) 1회 회복분만 남긴다 — 3회면 장애일 종목당 ~50초가 걸려
+    # 사이클이 밀리고(9/18 사이클 176회 스킵) 이미 느린 서버에 재시도 부하까지 더한다.
+    SELL_QUOTE_ATTEMPTS: int = Field(2, ge=1)  # 0이면 retry 가 호출조차 안 해 손절 감시가 통째로 꺼진다
+    # 매도 감시 공백 알림 임계(분): 한 종목의 시세 확인이 이 시간 이상 연속 실패하면 warn 1건,
+    # 복구 시 info 1건. 사이클 단위 일시 오류(모의서버에서 흔함)는 알리지 않는다.
+    SELL_STALE_ALERT_MIN: int = Field(5, ge=1)
     # 매도 사이클 내 장중 reconcile(잔고 동기화) 최소 간격(초). 매 60초 잔고 조회가
     # 모의서버 부하·레이트리밋의 주요인이라 완화 — 체결 전이 반영이 최대 이 간격만큼
     # 지연되지만(기본 5분) 14일 스윙 TP/SL 에 영향 미미. 15:40 마감 reconcile 은 별도.

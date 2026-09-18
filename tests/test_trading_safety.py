@@ -226,7 +226,10 @@ def test_sell_cycle_isolates_per_stock_errors(monkeypatch):
     monkeypatch.setattr(ts.flow_repo, "fetch_latest_snapshot", lambda: [])
     monkeypatch.setattr(ts, "_confirmed_daily_bars", lambda t, d: None)
 
-    def price(t):
+    quick_flags: list[bool] = []
+
+    def price(t, *, quick=False):
+        quick_flags.append(quick)
         if t == "000001":
             raise ts.kis_client.KisError("시세 조회 불가")
         return {"price": 80.0, "prev_close": 100.0, "change_pct": 0.0, "volume": 1.0}  # SL 히트
@@ -239,3 +242,29 @@ def test_sell_cycle_isolates_per_stock_errors(monkeypatch):
     assert res["errors"] == ["000001"]                 # 실패 종목은 기록만
     assert ("000002", "stop_loss") in sells            # 뒤 종목 SL 판정은 계속 동작
     assert res["sold"] == 1
+    assert quick_flags == [True, True]                 # 매도 감시는 재시도 축소 경로 사용
+    # 스케줄러 '감시 공백' 알림용 종목 상태: 실패 종목은 price None, 확인 종목은 현재가.
+    assert res["positions"]["000001"] == {"name": "A", "stop_loss": 90.0, "price": None,
+                                          "error": "KisError"}
+    assert res["positions"]["000002"]["price"] == 80.0
+    assert res["positions"]["000002"]["error"] is None
+
+
+def test_sell_cycle_treats_zero_price_as_failed_check(monkeypatch):
+    """빈 응답 등으로 현재가 0 — 손절 판정을 못 했으니 '확인 실패'로 기록(공백 추적이 끊기지 않게)."""
+    monkeypatch.setattr(ts, "_now_kst", lambda: _FAKE_NOW)
+    monkeypatch.setattr(ts.market_calendar, "is_market_hours", lambda now: True)
+    monkeypatch.setattr(ts, "reconcile", lambda: {"transitions": [], "status": "ok"})
+    monkeypatch.setattr(ts.trade_repo, "fetch_holdings", lambda env: [
+        {"id": 1, "ticker": "000001", "name": "A", "status": "holding", "quantity": 1,
+         "buy_price": 100.0, "buy_date": _FAKE_TODAY, "take_profit": 200.0, "stop_loss": 90.0}])
+    monkeypatch.setattr(ts, "_vix_t1", lambda today: None)
+    monkeypatch.setattr(ts.flow_repo, "fetch_latest_snapshot", lambda: [])
+    monkeypatch.setattr(ts.balance_service, "fetch_price",
+                        lambda t, *, quick=False: {"price": 0.0, "prev_close": 0.0,
+                                                   "change_pct": 0.0, "volume": 0.0})
+    monkeypatch.setattr(ts, "_market_sell", lambda rec, reason: pytest.fail("가격 0으로 매도하면 안 됨"))
+    res = ts.run_sell_cycle()
+    assert res["errors"] == ["000001"]
+    assert res["positions"]["000001"]["error"] == "invalid_price"
+    assert res["positions"]["000001"]["price"] is None

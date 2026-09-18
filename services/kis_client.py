@@ -16,15 +16,15 @@ import time
 import requests
 
 from core.config import settings
-from utils.crypto import mask_secrets
+from utils.crypto import mask_account, mask_secrets
 from utils.logger import get_logger
 from utils.retry import retry
 
 logger = get_logger(__name__)
 
-# HTTP 타임아웃(초) — config 외부화. 모의서버(openapivts)가 장 후반(14:30~15:30)에
-# 10초를 초과해 응답하는 패턴이 관측되어(2026-09 운영) 기본값을 15초로 상향.
-_TIMEOUT = float(settings.KIS_TIMEOUT_SEC)
+# HTTP 타임아웃 (연결, 읽기)초 — config 외부화. 모의서버(openapivts)가 장 후반(14:30~15:30)에
+# 10초를 초과해 응답하는 패턴이 관측되어(2026-09 운영) 읽기는 15초. 연결은 정상 시 수 ms라 별도로 짧게.
+_TIMEOUT = (float(settings.KIS_CONNECT_TIMEOUT_SEC), float(settings.KIS_TIMEOUT_SEC))
 
 # ── 호출 페이싱(초당 건수 제한) ──────────────────────────────
 # KIS 모의투자는 초당 2건 제한 — 초과 시 EGW00201 거절. 주문 POST 는 재시도 금지라
@@ -56,8 +56,13 @@ class KisOrderUncertainError(KisError):
     """
 
 
-def _mask(text: str) -> str:
-    return mask_secrets(text, [settings.kis_appkey, settings.kis_appsecret])
+def _mask(text: str, token: str | None = None) -> str:
+    """예외/로그 문자열의 시크릿·토큰·계좌번호 마스킹(§2.6). 잔고 조회 등은 계좌번호를 쿼리스트링에
+    싣기 때문에 requests 예외 메시지(URL 포함)에 계좌번호가 그대로 들어간다. 토큰은 헤더 값 오류
+    (InvalidHeader) 메시지에 'Bearer …' 로 통째로 실릴 수 있다."""
+    text = mask_secrets(text, [settings.kis_appkey, settings.kis_appsecret, token])
+    cano = settings.kis_cano
+    return text.replace(cano, mask_account(cano)) if cano else text
 
 
 def _common_headers(tr_id: str, token: str, hashkey: str | None = None) -> dict:
@@ -123,21 +128,35 @@ def make_hashkey(body: dict) -> str | None:
     return None
 
 
-@retry(attempts=3, base_delay=1.0, backoff=2.0, exceptions=(KisError, requests.RequestException))
+_GET_RETRYABLE = (KisError, requests.RequestException)
+
+
+@retry(attempts=3, base_delay=1.0, backoff=2.0, exceptions=_GET_RETRYABLE)
 def get(path: str, tr_id: str, params: dict, token: str | None = None) -> dict:
     """읽기 전용 GET(시세/잔고). 멱등 → 재시도 안전. rt_cd != 0 이면 KisError."""
+    return _get_once(path, tr_id, params, token)
+
+
+@retry(attempts=settings.SELL_QUOTE_ATTEMPTS, base_delay=1.0, backoff=2.0, exceptions=_GET_RETRYABLE)
+def get_quick(path: str, tr_id: str, params: dict, token: str | None = None) -> dict:
+    """재시도를 줄인 GET — 곧 다음 주기가 다시 확인하는 매도 감시(1분 주기)용."""
+    return _get_once(path, tr_id, params, token)
+
+
+def _get_once(path: str, tr_id: str, params: dict, token: str | None = None) -> dict:
     token = token or _token()
     url = f"{settings.kis_active_url}{path}"
     try:
         _throttle()
         resp = requests.get(url, headers=_common_headers(tr_id, token), params=params, timeout=_TIMEOUT)
     except requests.RequestException as exc:
-        raise KisError(f"GET {path} 실패: {_mask(str(exc))}") from None
+        raise KisError(f"GET {path} 실패: {_mask(str(exc), token)}") from None
     if resp.status_code != 200:
-        raise KisError(f"GET {path} HTTP {resp.status_code}: {_mask(resp.text)[:200]}")
+        raise KisError(f"GET {path} HTTP {resp.status_code}: {_mask(resp.text, token)[:200]}")
     data = resp.json()
     if str(data.get("rt_cd", "0")) != "0":
-        raise KisError(f"GET {path} rt_cd={data.get('rt_cd')} {data.get('msg_cd')}: {data.get('msg1')}")
+        raise KisError(f"GET {path} rt_cd={data.get('rt_cd')} {data.get('msg_cd')}: "
+                       f"{_mask(str(data.get('msg1')), token)}")
     return data
 
 
@@ -157,14 +176,20 @@ def post_order(path: str, tr_id: str, body: dict, token: str | None = None) -> d
         resp = requests.post(
             url, headers=_common_headers(tr_id, token, hashkey), json=body, timeout=_TIMEOUT
         )
+    except requests.ConnectTimeout as exc:
+        # TCP 연결 자체가 안 열림 = 요청 바이트 미송신 → 주문 미도달 확정. 확정 실패로 올려야
+        # 매도가 holding 으로 복귀해 다음 사이클이 재판정한다(불명 처리 시 당일 손절 재시도 불가).
+        # ReadTimeout·SSLError 등은 본문 송신 뒤일 수 있어 아래 '불명'으로 둔다.
+        raise KisError(f"주문 POST {path} 연결 실패(미전송 확정): {_mask(str(exc), token)}") from None
     except requests.RequestException as exc:
         # 네트워크 예외: 주문이 서버에 도달했는지 불확실 → 절대 재시도하지 말고 호출자가 reconcile 로 확인.
         raise KisOrderUncertainError(
-            f"주문 POST {path} 통신 예외(체결여부 불명, 재시도 금지): {_mask(str(exc))}"
+            f"주문 POST {path} 통신 예외(체결여부 불명, 재시도 금지): {_mask(str(exc), token)}"
         ) from None
     if resp.status_code != 200:
-        raise KisError(f"주문 POST {path} HTTP {resp.status_code}: {_mask(resp.text)[:200]}")
+        raise KisError(f"주문 POST {path} HTTP {resp.status_code}: {_mask(resp.text, token)[:200]}")
     data = resp.json()
     if str(data.get("rt_cd", "1")) != "0":
-        raise KisError(f"주문 거부 {path} rt_cd={data.get('rt_cd')} {data.get('msg_cd')}: {data.get('msg1')}")
+        raise KisError(f"주문 거부 {path} rt_cd={data.get('rt_cd')} {data.get('msg_cd')}: "
+                       f"{_mask(str(data.get('msg1')), token)}")
     return data

@@ -379,7 +379,9 @@ def _market_sell(rec: dict, reason: str) -> bool:
                      rec.get("name"), rec["ticker"], exc)
         notification_service.notify_error(
             "매도 주문 체결여부 불명",
-            f"{rec.get('name')}({rec['ticker']}) 사유={reason} — 재전송 금지, reconcile 이 잔고로 확정합니다.",
+            f"{rec.get('name')}({rec['ticker']}) 사유={reason} — 이중 매도 방지를 위해 오늘은 자동 재주문하지 "
+            "않습니다. 체결되면 reconcile 이 매도 완료로 확정하고, 미체결이면 다음 영업일에 감시를 재개합니다. "
+            "손절 사유라면 KIS 잔고를 직접 확인해 주세요.",
         )
         return False
     except kis_client.KisError as exc:
@@ -460,8 +462,13 @@ def run_sell_cycle() -> dict:
             logger.warning("수급 스냅샷 stale(%s, %d영업일) — 매도 flow 가중 생략", calc_date, gap)
     sold = 0
     errors: list[str] = []
+    # 종목별 감시 상태(스케줄러의 '감시 공백' 알림용). price = 이번 사이클에 받은 유효 현재가
+    # (시세 실패 시 None), error = 실패 원인(예외 타입명 또는 invalid_price, 정상이면 None).
+    positions: dict[str, dict] = {}
     for rec in holdings:
         ticker = rec["ticker"]
+        positions[ticker] = {"name": rec.get("name"), "stop_loss": rec.get("stop_loss"),
+                             "price": None, "error": None}
         # 종목별 예외 격리 — 한 종목의 시세/DB 오류가 나머지 보유 종목의 손절/익절 감시를
         # 막으면 안 된다(손절 감시는 최종 안전망). 실패 종목만 스킵하고 다음 사이클 재시도.
         try:
@@ -478,11 +485,18 @@ def run_sell_cycle() -> dict:
                 trade_repo.update_record(rec["id"], {"take_profit": tp, "stop_loss": sl, "atr": atr,
                                                      "risk_unmanaged": False})
                 rec["take_profit"], rec["stop_loss"] = tp, sl
+                positions[ticker]["stop_loss"] = sl
 
-            quote = balance_service.fetch_price(ticker)
+            quote = balance_service.fetch_price(ticker, quick=True)
             price = quote["price"]
             if price <= 0:
+                # 빈 응답(rt_cd 누락 + output 없음) 등 — 손절 판정을 못 했으니 '확인 실패'로 기록해야
+                # 감시 공백 추적이 끊기지 않는다(성공으로 치면 연속 실패 시계가 리셋됨).
+                logger.warning("매도 점검 스킵 %s(%s) — 유효하지 않은 현재가 %s", rec.get("name"), ticker, price)
+                positions[ticker]["error"] = "invalid_price"
+                errors.append(ticker)
                 continue
+            positions[ticker]["price"] = price
             sl_hit = price <= rec["stop_loss"]
             tp_hit = price >= rec["take_profit"]
             time_stop = bool(rec.get("buy_date")) and _busdays(rec["buy_date"], today) >= settings.TIME_STOP_DAYS
@@ -501,12 +515,14 @@ def run_sell_cycle() -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.error("매도 점검 실패 %s(%s): %s — 이 종목만 스킵(다음 사이클 재시도)",
                          rec.get("name"), ticker, exc)
+            # 시세는 받았는데 그 뒤(DB 선점·일봉 등)에서 실패했을 수도 있다 — 알림이 원인을 구분하도록 기록.
+            positions[ticker]["error"] = type(exc).__name__
             errors.append(ticker)
 
     logger.info("매도 사이클 — 점검 %d, 매도주문 %d, 오류 %d (VIX[T-1]=%s)",
                 len(holdings), sold, len(errors), vix)
     return {"checked": len(holdings), "sold": sold, "errors": errors,
-            "vix_t1": vix, "status": "ok"}
+            "positions": positions, "vix_t1": vix, "status": "ok"}
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -69,10 +69,14 @@ def fetch_orderable(ticker: str, price: int) -> dict:
     return {"cash": _f(out.get("ord_psbl_cash")), "max_qty": int(_f(out.get("max_buy_qty")))}
 
 
-def fetch_price(ticker: str) -> dict:
-    """현재가 조회 → {price: 현재가, prev_close: 기준가(전일종가), change_pct: 전일대비율, volume: 누적거래량}."""
+def fetch_price(ticker: str, *, quick: bool = False) -> dict:
+    """현재가 조회 → {price: 현재가, prev_close: 기준가(전일종가), change_pct: 전일대비율, volume: 누적거래량}.
+
+    quick=True: 재시도 축소(SELL_QUOTE_ATTEMPTS) — 매도 감시처럼 다음 주기가 곧 재확인하는 호출용.
+    """
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
-    data = kis_client.get(_PRICE_PATH, "FHKST01010100", params)
+    getter = kis_client.get_quick if quick else kis_client.get
+    data = getter(_PRICE_PATH, "FHKST01010100", params)
     out = data.get("output") or {}
     return {
         "price": _f(out.get("stck_prpr")),       # 현재가

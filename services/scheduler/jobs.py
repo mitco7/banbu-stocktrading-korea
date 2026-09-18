@@ -134,32 +134,112 @@ def job_execute_buys() -> None:
                 result.get("status"), result.get("ordered"))
 
 
-# 매도 감시 일시 오류 누적(요약 알림용) — 발송 시점에 리셋.
-_sell_err_total: int = 0
-_sell_err_tickers: set[str] = set()
+# 매도 감시 공백 추적(종목별). 사이클 단위 일시 오류는 모의서버에서 흔해(2026-09 운영 관측)
+# 건별로 알리면 소음이 된다 — 한 종목의 점검이 SELL_STALE_ALERT_MIN 이상 연속 실패할 때만
+# warn 1건, 복구되면 info 1건. 단, 손절선 아래인데 매도 처리가 실패하면 기다리지 않고 즉시 error.
+_fail_since: dict[str, float] = {}      # 연속 실패 시작(monotonic 초)
+_gap_alerted: set[str] = set()          # 공백 warn 발송 완료
+_sl_fail_alerted: set[str] = set()      # '손절선 도달·매도 실패' error 발송 완료
+_last_price: dict[str, float] = {}      # 마지막으로 받은 유효 현재가
+_last_error: dict[str, str] = {}        # 마지막 실패 원인(예외 타입명 / invalid_price)
+_names: dict[str, str] = {}             # 종목명(장 마감 알림용 — 그 시점엔 사이클 결과가 없다)
+
+
+def _mono() -> float:
+    return time.monotonic()
+
+
+def _position_line(ticker: str, pos: dict, head: str) -> str:
+    name = pos.get("name") or ticker
+    last, sl = _last_price.get(ticker), pos.get("stop_loss")
+    if last and sl:
+        tail = f"마지막 확인가 {last:,.0f}원 · 손절선 {sl:,.0f}원까지 {(last / sl - 1) * 100:+.1f}%"
+    else:
+        tail = "오늘 확인된 가격 없음"
+    return f"• {name}({ticker}) — {head} · {tail}"
+
+
+def _failure_kind(ticker: str) -> str:
+    """시세 자체를 못 받았는지, 시세는 받았는데 매도 처리 단계가 실패했는지 구분."""
+    err = _last_error.get(ticker)
+    if err == "invalid_price":
+        return "현재가 응답 비정상"
+    if err in (None, "KisError"):
+        return "시세 확인 불가(KIS 응답 지연·실패)"
+    return f"매도 처리 오류({err})"
+
+
+def _reset_sell_tracking() -> None:
+    for tracked in (_fail_since, _gap_alerted, _sl_fail_alerted, _last_price, _last_error, _names):
+        tracked.clear()
 
 
 def job_sell_cycle() -> None:
     """장중 매도 감시(TP/SL·기술신호·time-stop). 장외엔 내부 가드가 즉시 반환하므로 상시 주기 안전."""
-    global _sell_err_total
     result = trading_service.run_sell_cycle()
-    errors = result.get("errors") or []
-    if not errors:
+    if result.get("status") != "ok":
+        # 공백인 채로 장이 끝났으면 1건 알린다(복구 알림이 영영 안 오는 상태를 남기지 않도록).
+        if result.get("status") == "market_closed" and _gap_alerted:
+            notification_service.notify_info(
+                "장 마감 — 감시 공백 상태로 마감한 종목",
+                "\n".join(f"• {_names.get(t) or t}({t})" for t in sorted(_gap_alerted))
+                + "\n오늘 장 마감까지 점검이 복구되지 않았습니다. 다음 장 시작 후 다시 감시합니다.",
+            )
+        # 장외·보유 없음 — 감시가 끝났으니 추적도 초기화(다음 장 첫 실패를 전날부터로 오산 방지).
+        _reset_sell_tracking()
         return
-    # 모의서버 장후반 응답 지연 등 일시 오류가 사이클 단위로 흔하다(2026-09 운영 관측) —
-    # 건별 error 알림 대신 누적 요약 warn 1건(쿨다운). 종목별 격리로 감시 자체는 계속 돈다.
-    _sell_err_total += len(errors)
-    _sell_err_tickers.update(errors)
-    sent = _notify_throttled(
-        "sell_cycle_stock_errors",
-        f"매도 감시 일시 오류 누적 {_sell_err_total}건 — 자동 재시도 중",
-        "KIS 응답 지연 등으로 해당 종목·사이클만 스킵됨(다음 사이클 재시도, 감시는 계속). "
-        f"영향 종목: {', '.join(sorted(_sell_err_tickers))}",
-        level="warn",
-    )
-    if sent:
-        _sell_err_total = 0
-        _sell_err_tickers.clear()
+
+    now = _mono()
+    positions: dict[str, dict] = result.get("positions") or {}
+    errors = set(result.get("errors") or [])
+    for tracked in (_fail_since, _last_price, _last_error, _names):  # 보유에서 빠진 종목(청산 등)은 추적 종료
+        for t in [t for t in tracked if t not in positions]:
+            tracked.pop(t)
+    _gap_alerted.intersection_update(positions)
+    _sl_fail_alerted.intersection_update(positions)
+
+    recovered: list[str] = []
+    urgent: list[str] = []
+    for t, pos in positions.items():
+        price, sl = pos.get("price"), pos.get("stop_loss")
+        if pos.get("name"):
+            _names[t] = pos["name"]
+        if price:
+            _last_price[t] = price  # 시세를 받은 뒤 실패한 경우도 최신가는 유지
+        if t in errors:
+            _fail_since.setdefault(t, now)
+            _last_error[t] = pos.get("error") or "KisError"
+            if price and sl and price <= sl and t not in _sl_fail_alerted:
+                urgent.append(t)
+            continue
+        started = _fail_since.pop(t, None)
+        _last_error.pop(t, None)
+        _sl_fail_alerted.discard(t)
+        if t in _gap_alerted:
+            _gap_alerted.discard(t)
+            gap = f"약 {(now - started) / 60:.0f}분 만에 " if started is not None else ""
+            recovered.append(f"• {pos.get('name') or t}({t}) — {gap}점검 재개")
+
+    if urgent and notification_service.notify_error(
+        f"손절선 도달 — 매도 처리 실패 {len(urgent)}종목",
+        "\n".join(_position_line(t, positions[t], f"매도 처리 오류({_last_error[t]})") for t in urgent)
+        + "\n1분마다 자동 재시도 중입니다. 바로 해소되지 않으면 KIS 잔고를 직접 확인해 주세요.",
+    ):
+        _sl_fail_alerted.update(urgent)
+
+    threshold = settings.SELL_STALE_ALERT_MIN * 60
+    stale = sorted(t for t, since in _fail_since.items()
+                   if t not in _gap_alerted and now - since >= threshold)
+    if stale and notification_service.notify_warn(
+        f"매도 감시 공백 — {len(stale)}종목 {settings.SELL_STALE_ALERT_MIN}분 이상 점검 실패",
+        "\n".join(_position_line(t, positions[t],
+                                 f"{(now - _fail_since[t]) / 60:.0f}분째 {_failure_kind(t)}")
+                  for t in stale)
+        + "\n이 종목의 익절·손절 판단이 멈춰 있습니다. 1분마다 자동 재시도 중이며, 복구되면 다시 알려드립니다.",
+    ):
+        _gap_alerted.update(stale)  # 발송 실패 시 다음 사이클에 다시 시도
+    if recovered:
+        notification_service.notify_info("매도 감시 정상화", "\n".join(recovered))
 
 
 def job_reconcile_close() -> None:

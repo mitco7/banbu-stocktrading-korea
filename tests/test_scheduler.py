@@ -15,10 +15,13 @@ KST = ZoneInfo("Asia/Seoul")
 
 @pytest.fixture(autouse=True)
 def _reset_error_cooldown():
-    """테스트 간 에러 알림 쿨다운 상태 격리."""
-    jobs._last_error_notify.clear()
+    """테스트 간 에러 알림 쿨다운·감시 공백 추적 상태 격리."""
+    def clear():
+        jobs._last_error_notify.clear()
+        jobs._reset_sell_tracking()
+    clear()
     yield
-    jobs._last_error_notify.clear()
+    clear()
 
 
 # ── 잡 등록 ────────────────────────────────────────────────────────────────
@@ -79,24 +82,117 @@ def test_wrap_swallows_exception_and_notifies_once(monkeypatch):
     assert calls == ["스케줄 잡 실패 — sell_cycle"]
 
 
-def test_sell_cycle_error_summary_accumulates_and_resets(monkeypatch):
-    """매도 감시 일시 오류는 건별 error 대신 누적 요약 warn — 발송 시 리셋, 쿨다운 내엔 누적만."""
-    jobs._sell_err_total = 0
-    jobs._sell_err_tickers.clear()
-    warns, errs = [], []
-    monkeypatch.setattr(jobs.notification_service, "notify_warn", lambda t, m="": warns.append(t) or True)
-    monkeypatch.setattr(jobs.notification_service, "notify_error", lambda t, m="": errs.append(t) or True)
-    monkeypatch.setattr(jobs.trading_service, "run_sell_cycle",
-                        lambda: {"errors": ["005930", "000660"]})
-    jobs.job_sell_cycle()  # 쿨다운 열림 → warn 1건 발송 + 누적 리셋
-    assert warns == ["매도 감시 일시 오류 누적 2건 — 자동 재시도 중"]
-    assert not errs
-    assert jobs._sell_err_total == 0 and not jobs._sell_err_tickers
+def _sell_result(errors: list[str], prices: dict[str, float | None]) -> dict:
+    """run_sell_cycle 결과 모사 — 보유 종목별 name/stop_loss/price(실패 종목은 None)."""
+    return {"status": "ok", "errors": errors,
+            "positions": {t: {"name": f"종목{t[-1]}", "stop_loss": 90_000.0, "price": p}
+                          for t, p in prices.items()}}
 
-    monkeypatch.setattr(jobs.trading_service, "run_sell_cycle", lambda: {"errors": ["066570"]})
-    jobs.job_sell_cycle()  # 쿨다운 내 → 발송 없이 누적만
-    assert len(warns) == 1
-    assert jobs._sell_err_total == 1 and jobs._sell_err_tickers == {"066570"}
+
+@pytest.fixture
+def sell_gap(monkeypatch):
+    """매도 감시 공백 알림 테스트 하네스 — 시계·사이클 결과·Slack 발송을 조작/기록."""
+    state = {"now": 0.0, "result": {}, "warns": [], "infos": [], "errors": [], "slack_ok": True}
+    monkeypatch.setattr(jobs, "_mono", lambda: state["now"])
+    monkeypatch.setattr(jobs.trading_service, "run_sell_cycle", lambda: state["result"])
+
+    def recorder(key):
+        return lambda t, m="": state[key].append((t, m)) or state["slack_ok"]
+    monkeypatch.setattr(jobs.notification_service, "notify_warn", recorder("warns"))
+    monkeypatch.setattr(jobs.notification_service, "notify_info", recorder("infos"))
+    monkeypatch.setattr(jobs.notification_service, "notify_error", recorder("errors"))
+
+    def cycle(minute: float, errors: list[str], prices: dict[str, float | None]) -> None:
+        state["now"] = minute * 60
+        state["result"] = _sell_result(errors, prices)
+        jobs.job_sell_cycle()
+    state["cycle"] = cycle
+    return state
+
+
+def test_sell_gap_alerts_once_after_threshold_then_recovers(sell_gap):
+    """사이클 단위 일시 실패는 조용히, 임계 이상 연속 실패는 warn 1건, 복구 시 info 1건."""
+    limit = settings.SELL_STALE_ALERT_MIN
+    cycle = sell_gap["cycle"]
+    cycle(0, [], {"000001": 100_000.0, "000002": 95_000.0})          # 정상 — 마지막 확인가 기록
+    cycle(1, ["000001"], {"000001": None, "000002": 95_000.0})        # 실패 시작
+    cycle(limit, ["000001"], {"000001": None, "000002": 95_000.0})    # 임계 직전(limit-1분 경과)
+    assert sell_gap["warns"] == []
+    cycle(limit + 1, ["000001"], {"000001": None, "000002": 95_000.0})  # 임계 도달 → warn 1건
+    assert len(sell_gap["warns"]) == 1
+    title, body = sell_gap["warns"][0]
+    assert "1종목" in title and "종목1(000001)" in body
+    assert "시세 확인 불가" in body                                     # 원인 구분(시세 단계 실패)
+    assert "마지막 확인가 100,000원" in body and "+11.1%" in body     # 손절선 90,000 대비 여유
+    cycle(limit + 3, ["000001"], {"000001": None, "000002": 95_000.0})  # 계속 실패 — 재알림 없음
+    assert len(sell_gap["warns"]) == 1
+    cycle(limit + 4, [], {"000001": 101_000.0, "000002": 95_000.0})   # 복구 → info 1건
+    assert len(sell_gap["infos"]) == 1 and "000001" in sell_gap["infos"][0][1]
+    assert not jobs._fail_since and not jobs._gap_alerted
+
+
+def test_sell_gap_intermittent_failures_stay_silent(sell_gap):
+    """실패와 성공이 번갈아 나오면(9/18 모의서버 패턴) 연속 실패가 임계에 못 미쳐 알림 없음."""
+    for minute in range(0, 30):
+        failing = ["000001"] if minute % 2 else []
+        sell_gap["cycle"](minute, failing, {"000001": None if failing else 100_000.0})
+    assert sell_gap["warns"] == [] and sell_gap["infos"] == []
+
+
+def test_sell_gap_state_resets_after_market_close(sell_gap):
+    """장 마감(market_closed) 후엔 추적 초기화 — 다음 날 첫 실패를 전날부터 이어진 공백으로 오산하지 않는다."""
+    sell_gap["cycle"](0, ["000001"], {"000001": None})
+    sell_gap["result"] = {"status": "market_closed", "checked": 0, "sold": 0}
+    jobs.job_sell_cycle()
+    assert not jobs._fail_since
+    sell_gap["cycle"](18 * 60, ["000001"], {"000001": None})  # 다음 날 장 시작 첫 실패
+    assert sell_gap["warns"] == []
+
+
+def test_sell_gap_drops_positions_no_longer_held(sell_gap):
+    """청산 등으로 보유에서 빠진 종목은 추적을 끝낸다(없는 종목에 공백 알림 금지)."""
+    limit = settings.SELL_STALE_ALERT_MIN
+    sell_gap["cycle"](0, ["000001"], {"000001": None, "000002": 95_000.0})
+    sell_gap["cycle"](limit + 1, [], {"000002": 95_000.0})  # 000001 매도 완료로 보유 목록에서 빠짐
+    assert sell_gap["warns"] == [] and "000001" not in jobs._fail_since
+
+
+def test_stop_loss_hit_but_sell_processing_fails_alerts_immediately(sell_gap):
+    """시세는 받았고 손절선 아래인데 그 뒤(DB 선점 등)가 실패 — 5분 기다리지 말고 즉시 error 1건."""
+    sell_gap["result"] = _sell_result(["000001"], {"000001": 85_000.0})
+    sell_gap["result"]["positions"]["000001"]["error"] = "APIError"
+    jobs.job_sell_cycle()
+    assert len(sell_gap["errors"]) == 1
+    title, body = sell_gap["errors"][0]
+    assert "손절선 도달" in title and "매도 처리 오류(APIError)" in body and "85,000원" in body
+    jobs.job_sell_cycle()                                   # 같은 실패 반복 — 재알림 없음
+    assert len(sell_gap["errors"]) == 1
+    sell_gap["cycle"](1, [], {"000001": 85_000.0})          # 정상 처리되면 추적 해제
+    assert "000001" not in jobs._sl_fail_alerted
+
+
+def test_gap_alert_retries_when_slack_send_fails(sell_gap):
+    """Slack 발송이 실패하면 '알림 완료'로 표시하지 않고 다음 사이클에 다시 보낸다."""
+    limit = settings.SELL_STALE_ALERT_MIN
+    sell_gap["cycle"](0, ["000001"], {"000001": None})
+    sell_gap["slack_ok"] = False
+    sell_gap["cycle"](limit, ["000001"], {"000001": None})
+    assert len(sell_gap["warns"]) == 1 and not jobs._gap_alerted
+    sell_gap["slack_ok"] = True
+    sell_gap["cycle"](limit + 1, ["000001"], {"000001": None})
+    assert len(sell_gap["warns"]) == 2 and jobs._gap_alerted == {"000001"}
+
+
+def test_market_close_reports_unresolved_gap(sell_gap):
+    """공백 경고 후 복구 없이 장이 끝나면 마감 알림 1건(복구 알림이 영영 안 오는 상태 방지)."""
+    limit = settings.SELL_STALE_ALERT_MIN
+    sell_gap["cycle"](0, ["000001"], {"000001": None})
+    sell_gap["cycle"](limit, ["000001"], {"000001": None})
+    sell_gap["result"] = {"status": "market_closed", "checked": 0, "sold": 0}
+    jobs.job_sell_cycle()
+    jobs.job_sell_cycle()                                   # 장외 반복 호출 — 마감 알림은 1건만
+    closing = [m for t, m in sell_gap["infos"] if t.startswith("장 마감")]
+    assert len(closing) == 1 and "종목1(000001)" in closing[0]
 
 
 def test_wrap_notifies_again_after_cooldown(monkeypatch):
