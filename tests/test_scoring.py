@@ -110,6 +110,21 @@ def test_hard_filter_asof_gap():
     assert r is not None and r.startswith("asof_gap")
 
 
+def test_hard_filter_counts_holidays_as_non_business_days():
+    """연휴 직후: 직전 거래일 데이터는 stale 이 아니다(2026-09-28 전 종목 오탈락 사고).
+
+    9/24·25 는 추석 휴장 → 9/23 지표와 9/28 ML 의 격차는 달력 평일로 3일이지만 영업일로는 1일.
+    """
+    row = _good_row(indicator_date="2026-09-23", flow_calc_date="2026-09-23")
+    assert sc.hard_filter(row, effective_min_rise=3.0, ml_asof="2026-09-28") is None
+    assert sc._busday_gap(["2026-09-23", "2026-09-28"]) == 1
+    # 휴장일이 없는 구간은 기존과 동일하게 센다(완화가 아니라 달력 정정).
+    assert sc._busday_gap(["2026-09-21", "2026-09-23"]) == 2
+    # 진짜 오래된 데이터는 여전히 막는다.
+    stale = _good_row(indicator_date="2026-09-16", flow_calc_date="2026-09-16")
+    assert (sc.hard_filter(stale, effective_min_rise=3.0, ml_asof="2026-09-28") or "").startswith("asof_gap")
+
+
 # ── VIX 게이트 (look-ahead 차단) ───────────────────────────────────────────
 def _patch_vix(monkeypatch, values: list[float]):
     # 평일 날짜에 values 매핑(오름차순). fetch_series_before 는 당일 미만만 반환.

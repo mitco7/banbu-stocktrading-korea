@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from core import market_calendar
 from core.config import SCORE_TIE_BREAKERS, settings
 from core.market_spec import DATE_COL
 from db.repositories import (
@@ -143,11 +144,16 @@ def total_score(ml: float, tech: float, flow: float, vol: float) -> float:
 #  하드필터 (점수 전 제외, fail-close)
 # ──────────────────────────────────────────────────────────────────────────
 def _busday_gap(dates: list[str]) -> int:
-    """날짜 문자열 리스트의 최대 영업일 격차."""
+    """날짜 문자열 리스트의 최대 KRX 영업일 격차(주말 + 휴장일 제외).
+
+    ⚠ 휴장일을 빼지 않으면 연휴 뒤 정상 데이터가 stale 로 오판된다 — 2026-09-28(추석 연휴
+    직후 첫 거래일)에 직전 거래일(9/23) 데이터의 격차가 3으로 계산돼 후보 4종목이 전부
+    asof_gap 으로 탈락했다. 휴장일 제외 시 1영업일. trading_service._busdays 와 동일 기준.
+    """
     ds = sorted(pd.Timestamp(d).date() for d in dates if d)
     if len(ds) < 2:
         return 0
-    return int(np.busday_count(ds[0], ds[-1]))
+    return market_calendar.krx_busdays(ds[0], ds[-1])
 
 
 def hard_filter(row: dict, effective_min_rise: float, ml_asof: str | None) -> str | None:
