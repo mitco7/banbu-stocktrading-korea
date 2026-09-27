@@ -18,6 +18,16 @@ _FAKE_NOW = datetime(2026, 6, 12, 9, 30, tzinfo=ts.KST)
 _FAKE_TODAY = "2026-06-12"
 
 
+@pytest.fixture(autouse=True)
+def _orders_enabled_by_default(monkeypatch):
+    """주문 경로 테스트는 운영 .env 의 TRADING_ENABLED 값과 무관해야 한다.
+
+    (서버 .env 가 false 인 상태에서 테스트가 무더기로 깨져 발견 — 테스트는 환경이 아니라
+    자기 설정으로 동작을 고정한다. 비활성 동작은 해당 테스트가 직접 False 로 덮어쓴다.)
+    """
+    monkeypatch.setattr(ts.settings, "TRADING_ENABLED", True)
+
+
 @pytest.fixture
 def patched(monkeypatch):
     calls = {"orders": 0, "updates": []}
@@ -248,6 +258,32 @@ def test_sell_cycle_isolates_per_stock_errors(monkeypatch):
                                           "error": "KisError"}
     assert res["positions"]["000002"]["price"] == 80.0
     assert res["positions"]["000002"]["error"] is None
+
+
+def test_trading_disabled_blocks_every_kis_order(patched, monkeypatch):
+    """TRADING_ENABLED=false — 분석·추천은 그대로 두고 주문 경로만 차단(모의계좌 만료 기간 운용).
+
+    매수·매도·정합성 동기화 어디서도 KIS 를 호출하면 안 된다(만료 계좌 오류·알림 소음 방지).
+    """
+    monkeypatch.setattr(ts.settings, "TRADING_ENABLED", False)
+    monkeypatch.setattr(ts.kis_client, "post_order",
+                        lambda *a, **k: pytest.fail("주문 집행이 꺼져 있으면 주문을 보내면 안 됨"))
+    for name in ("fetch_balance", "fetch_price", "fetch_orderable"):
+        monkeypatch.setattr(ts.balance_service, name,
+                            lambda *a, **k: pytest.fail(f"주문 비활성 상태에서 KIS {name} 호출 금지"))
+    infos: list[tuple] = []
+    monkeypatch.setattr(ts.notification_service, "notify_info",
+                        lambda t, m="": infos.append((t, m)) or True)
+    monkeypatch.setattr(ts.market_calendar, "is_trading_day", lambda now: True)
+    monkeypatch.setattr(ts.market_calendar, "is_market_hours", lambda now: True)
+
+    buy = ts.execute_buys()
+    assert buy["status"] == "trading_disabled" and buy["ordered"] == 0
+    assert infos and "주문하지 않았습니다" in infos[0][0]
+    assert "삼성전자(005930)" in infos[0][1]          # 추천 종목은 알림에 그대로 남는다
+
+    assert ts.run_sell_cycle()["status"] == "trading_disabled"
+    assert ts.reconcile()["status"] == "trading_disabled"
 
 
 def test_sell_cycle_treats_zero_price_as_failed_check(monkeypatch):

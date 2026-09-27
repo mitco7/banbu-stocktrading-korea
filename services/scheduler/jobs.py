@@ -332,6 +332,14 @@ def start() -> None:
         settings.SCHEDULE_PIPELINE_TIME, settings.SCHEDULE_BUY_TIME,
         settings.SCHEDULE_SELL_INTERVAL_SEC, settings.SCHEDULE_RECONCILE_TIME,
     )
+    # 주문이 꺼진 채로 돌고 있다는 사실은 재기동 때마다 분명히 남긴다(모르고 방치 방지).
+    if not settings.TRADING_ENABLED:
+        logger.warning("주문 집행 비활성(TRADING_ENABLED=false) — 분석·추천만 수행, KIS 주문 없음")
+        notification_service.notify_warn(
+            "주문 집행 꺼진 상태로 기동",
+            "데이터 수집·ML 분석·추천 알림은 정상 동작하지만 실제 매수·매도 주문은 보내지 않습니다. "
+            "복구하려면 새 모의투자 계좌를 .env 에 넣고 TRADING_ENABLED=true 로 변경 후 재기동하세요.",
+        )
 
 
 def shutdown() -> None:

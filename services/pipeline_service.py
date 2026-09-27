@@ -293,7 +293,14 @@ def _buy_summary(details: dict, decision_result: dict, market_blocked: bool) -> 
     if rest:
         lines.append("")
         lines.append("그 외: " + " · ".join(rest))
-    if stocks:
+    if stocks and not settings.TRADING_ENABLED:
+        # 주문 집행이 꺼진 기간엔 '오늘 집행' 문구가 거짓이 된다 — 추천임을 명시.
+        lines.append(
+            f"※ 지금은 주문 집행이 꺼져 있어(TRADING_ENABLED=false) 실제 매수·매도는 하지 않습니다. "
+            f"목표·손절가는 전일 종가와 ATR(익절 ×{settings.TP_ATR_MULT:g} / 손절 "
+            f"×{settings.SL_ATR_MULT:g}) 기준 참고용 예상치입니다."
+        )
+    elif stocks:
         lines.append(
             f"※ 매수는 오늘 {settings.SCHEDULE_BUY_TIME} 시장가 집행. 목표·손절가는 전일 종가와 "
             f"ATR(익절 ×{settings.TP_ATR_MULT:g} / 손절 ×{settings.SL_ATR_MULT:g}) 기준 예상치 — "

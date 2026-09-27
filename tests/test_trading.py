@@ -128,3 +128,37 @@ def test_sell_signals_uptrend_overbought():
     assert sig["dead_cross"] is False
     assert sig["panic"] is False
     assert sig["count"] == 1
+
+
+# ── 매도 확정 거부 알림 쿨다운 ─────────────────────────────────────────────
+def test_notify_sell_reject_cooldown(monkeypatch):
+    """같은 종목·같은 거부 메시지는 쿨다운 안에 1건만 발송, 다른 종목/메시지는 별도 발송."""
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(ts.notification_service, "notify_error",
+                        lambda title, msg="": sent.append((title, msg)) or True)
+    monkeypatch.setattr(settings, "SELL_REJECT_NOTIFY_COOLDOWN_SEC", 1800)
+    ts._last_sell_reject_notify.clear()
+
+    rec = {"ticker": "066570", "name": "LG전자"}
+    exc = ts.kis_client.KisError("주문 거부 rt_cd=1 40910000: 모의투자 주문이 불가한 계좌입니다.")
+
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    assert len(sent) == 1
+    assert "LG전자(066570)" in sent[0][1] and "40910000" in sent[0][1]
+
+    # 다른 종목은 독립 키
+    ts._notify_sell_reject({"ticker": "005930", "name": "삼성전자"}, "time_stop", exc)
+    assert len(sent) == 2
+
+    # 쿨다운 경과 후에는 다시 발송
+    ts._last_sell_reject_notify[("066570", str(exc))] -= 1801
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    assert len(sent) == 3
+
+    # 쿨다운 0 이면 매번 발송(끄기)
+    monkeypatch.setattr(settings, "SELL_REJECT_NOTIFY_COOLDOWN_SEC", 0)
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    ts._notify_sell_reject(rec, "time_stop", exc)
+    assert len(sent) == 5

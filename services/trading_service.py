@@ -176,6 +176,22 @@ def execute_buys(date: str | None = None) -> dict:
     if not market_calendar.is_trading_day(now):
         logger.info("매수 스킵 — 오늘(%s)은 KRX 휴장일/주말", today)
         return {"date": today, "ordered": 0, "status": "market_closed"}
+
+    # ── 가드 2: 주문 집행 스위치(§2.4) — 분석·추천은 그대로 두고 주문만 차단 ──
+    #    휴장일엔 위 가드가 먼저 걸러 알림이 나가지 않는다(거래일에만 1일 1회 안내).
+    if not settings.TRADING_ENABLED:
+        rec_date = decision_repo.latest_date()
+        buys = ([r for r in decision_repo.fetch_by_date(rec_date) if r.get("decision") == "BUY"]
+                if rec_date == today else [])
+        names = ", ".join(f"{r.get('name')}({r.get('ticker')})" for r in buys) or "없음"
+        logger.info("매수 스킵 — 주문 집행 비활성(TRADING_ENABLED=false), 오늘 BUY %d종목 미집행", len(buys))
+        notification_service.notify_info(
+            f"주문 집행 꺼짐 — 오늘 추천 {len(buys)}종목은 주문하지 않았습니다",
+            f"추천 종목: {names}\n"
+            "분석·추천 알림은 계속 발송되지만 실제 매수·매도 주문은 보내지 않습니다"
+            "(.env 의 TRADING_ENABLED=true 로 되돌리면 재개).",
+        )
+        return {"date": today, "ordered": 0, "status": "trading_disabled"}
     win_start, win_end = _parse_hhmm(settings.BUY_ORDER_START), _parse_hhmm(settings.BUY_ORDER_END)
     now_t = now.timetz().replace(tzinfo=None)
     if not (win_start <= now_t <= win_end):
@@ -344,6 +360,26 @@ def _vix_t1(today: str) -> float | None:
         return None
 
 
+# 매도 확정 거부 알림 쿨다운 — (ticker, 거부 메시지) → 마지막 발송 단조시각.
+_last_sell_reject_notify: dict[tuple[str, str], float] = {}
+
+
+def _notify_sell_reject(rec: dict, reason: str, exc: Exception) -> None:
+    """확정 거부 알림. 같은 종목·같은 거부 메시지는 SELL_REJECT_NOTIFY_COOLDOWN_SEC 당 1건만."""
+    key = (rec["ticker"], str(exc))
+    now = time.monotonic()
+    last = _last_sell_reject_notify.get(key)
+    if last is not None and now - last < settings.SELL_REJECT_NOTIFY_COOLDOWN_SEC:
+        return
+    _last_sell_reject_notify[key] = now
+    cooldown_min = settings.SELL_REJECT_NOTIFY_COOLDOWN_SEC // 60
+    notification_service.notify_error(
+        "매도 주문 실패",
+        f"{rec.get('name')}({rec['ticker']}) 사유={reason}: {exc}"
+        f" (매 사이클 재시도 중 — 같은 거부가 반복되면 {cooldown_min}분마다 1회만 알립니다)",
+    )
+
+
 def _market_sell(rec: dict, reason: str) -> bool:
     """보유 포지션 시장가 청산. 재시도 금지.
 
@@ -388,9 +424,7 @@ def _market_sell(rec: dict, reason: str) -> bool:
         # 확정 거부 — 주문이 안 나갔으므로 holding 복귀(다음 사이클 재시도 가능).
         logger.error("매도 주문 실패 %s(%s): %s", rec.get("name"), rec["ticker"], exc)
         trade_repo.update_record(rec["id"], {"status": "holding"})
-        notification_service.notify_error(
-            "매도 주문 실패", f"{rec.get('name')}({rec['ticker']}) 사유={reason}: {exc}"
-        )
+        _notify_sell_reject(rec, reason, exc)
         return False
 
 
@@ -429,6 +463,11 @@ def run_sell_cycle() -> dict:
     env = settings.kis_environment
     now = _now_kst()
     today = now.strftime("%Y-%m-%d")
+
+    # 주문을 못 보내는 기간엔 감시도 돌리지 않는다 — 청산할 수 없는 신호로 KIS 를 매분
+    # 호출해 봐야 알림 소음과 만료 계좌 오류만 쌓인다(TRADING_ENABLED=false).
+    if not settings.TRADING_ENABLED:
+        return {"checked": 0, "sold": 0, "status": "trading_disabled"}
 
     if not market_calendar.is_market_hours(now):
         return {"checked": 0, "sold": 0, "status": "market_closed"}
@@ -555,6 +594,12 @@ def reconcile() -> dict:
     - holding & 보유        → 수량 불일치 시 재동기화(부분체결·수동 개입 반영)
     - KIS 보유 & DB 없음    → 고아 INSERT(holding)
     """
+    # 주문을 안 보내는 기간엔 동기화할 주문도 없다 — 만료 계좌로 잔고를 조회하면 오류 알림만 쌓인다.
+    # ⚠ 다시 켤 때(새 모의계좌) 첫 reconcile 이 DB 보유와 새 계좌의 빈 잔고를 맞추며 정리한다.
+    if not settings.TRADING_ENABLED:
+        logger.info("정합성 동기화 스킵 — 주문 집행 비활성(TRADING_ENABLED=false)")
+        return {"transitions": [], "orphans": 0, "status": "trading_disabled"}
+
     env = settings.kis_environment
     bal = balance_service.fetch_balance()
     kis_holdings = bal["holdings"]            # {ticker: qty}
