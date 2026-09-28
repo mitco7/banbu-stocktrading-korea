@@ -120,6 +120,7 @@ def _stock_detail(decision_row: dict, rec_row: dict | None) -> dict:
         "reason": decision_row.get("reason"),
         "stage": decision_row.get("stage"),  # llm_reviewed / hard_filtered / market_blocked
         "rank": decision_row.get("rank"),
+        "llm_model": decision_row.get("llm_model"),  # 알림에 AI 검토 주체 표기
         # ── 5단계: 종합점수(하드필터 탈락·차단 종목은 NULL) ──
         "scores": {k: decision_row.get(k) for k in _SCORE_KEYS},
     }
@@ -216,43 +217,133 @@ def _eok(v) -> str:
     return f"{v / 1e8:+,.0f}억"
 
 
+_RSI_LABEL = {"overbought": "과열", "oversold": "과매도", "neutral": "중립"}
+
+
+def _won(v, nd: int = 0) -> str:
+    return f"{v:,.{nd}f}원" if isinstance(v, (int, float)) else "-"
+
+
+def _auto(v) -> str:
+    """지표 값 표기 — 큰 값은 정수, 작은 값은 소수 2자리(종목별 가격대 차이 흡수)."""
+    if not isinstance(v, (int, float)):
+        return "-"
+    return f"{v:,.0f}" if abs(v) >= 100 else f"{v:,.2f}"
+
+
+def _yn(flag) -> str:
+    return "O" if flag else "X"
+
+
+def _plan_lines(ml: dict, ind: dict) -> list[str]:
+    """매매 계획 — 기준가와 ATR 몇 배/몇 %로 익절·손절을 잡는지 숫자로."""
+    base, atr, atr_pct = ml.get("last_actual_price"), ind.get("atr"), ind.get("atr_pct")
+    if not (isinstance(base, (int, float)) and base > 0 and isinstance(atr, (int, float)) and atr > 0):
+        return []
+    tp, sl = base + atr * settings.TP_ATR_MULT, base - atr * settings.SL_ATR_MULT
+    pct_txt = f"주가의 {atr_pct:.2f}%" if isinstance(atr_pct, (int, float)) else "비율 미상"
+    asof = ind.get("indicator_date")
+    return [
+        f"매수 기준가 {_won(base)}({asof + ' ' if asof else ''}종가) → "
+        f"익절 {_won(tp)}({(tp / base - 1) * 100:+.1f}%) / 손절 {_won(sl)}({(sl / base - 1) * 100:+.1f}%)",
+        f"   ATR {_won(atr)}({pct_txt}) 기준 — 익절 ATR×{settings.TP_ATR_MULT:g} / 손절 "
+        f"ATR×{settings.SL_ATR_MULT:g}, {settings.TIME_STOP_DAYS}영업일 내 미도달 시 시간 청산",
+    ]
+
+
+def _tech_detail(ind: dict) -> str:
+    """기술지표 세부항목 — 종합점수의 '기술' 항이 왜 그 값인지 보이도록 항목별 수치."""
+    bits: list[str] = []
+    sma_s, sma_l = ind.get("sma_short"), ind.get("sma_long")
+    if isinstance(sma_s, (int, float)) and isinstance(sma_l, (int, float)):
+        bits.append(f"골든크로스 {_yn(ind.get('golden_cross'))}"
+                    f"(SMA{settings.SMA_SHORT} {sma_s:,.0f} vs SMA{settings.SMA_LONG} {sma_l:,.0f})")
+    macd, sig = ind.get("macd"), ind.get("macd_signal")
+    if macd is not None and sig is not None:
+        bits.append(f"MACD 매수 {_yn(ind.get('macd_buy'))}({_auto(macd)} vs 시그널 {_auto(sig)})")
+    rsi = ind.get("rsi")
+    if isinstance(rsi, (int, float)):
+        label = _RSI_LABEL.get(ind.get("rsi_signal") or "", "")
+        bits.append(f"RSI {rsi:.1f}{f'({label})' if label else ''}")
+    adx, p_di, m_di = ind.get("adx"), ind.get("plus_di"), ind.get("minus_di")
+    if isinstance(adx, (int, float)):
+        di = (f"(+DI {p_di:.1f} / -DI {m_di:.1f})"
+              if isinstance(p_di, (int, float)) and isinstance(m_di, (int, float)) else "")
+        bits.append(f"ADX {adx:.1f} 추세 {_yn(ind.get('trend_strong'))}{di}")
+    vol = ind.get("volume_ratio")
+    if isinstance(vol, (int, float)):
+        bits.append(f"거래량 평소의 {vol:.2f}배")
+    return " · ".join(bits)
+
+
+def _score_math(sc: dict) -> str:
+    """종합점수 산식 — 부문 점수 × 가중치의 합으로 총점이 나오는 과정을 그대로 보여준다."""
+    terms = [(sc.get(k), label, w) for k, label, w in (
+        ("ml_sub", "ML", settings.W_ML), ("tech_sub", "기술", settings.W_TECH),
+        ("flow_sub", "수급", settings.W_FLOW), ("vol_sub", "변동성", settings.W_VOL))]
+    parts = [f"{label} {v:.2f}×{w * 100:.0f}%" for v, label, w in terms if isinstance(v, (int, float))]
+    if not parts:
+        return ""
+    total = sc.get("total_score")
+    tail = f" = {total:.3f}" if isinstance(total, (int, float)) else ""
+    return "종합점수 산식: " + " + ".join(parts) + tail
+
+
 def _stock_block(idx: int, s: dict) -> str:
-    """BUY 종목 1건 — 예상 매매가와 판단 근거(ML·수급·점수·AI 검토)를 묶은 블록."""
+    """BUY 종목 1건 — 매매 계획과 판단 근거(ML·수급·기술지표·점수 산식·AI 검토) 전부."""
     ml = s.get("ml_prediction") or {}
     fl = s.get("investor_flow") or {}
     ind = s.get("technical_indicators") or {}
     sc = s.get("scores") or {}
-    lines = [f"*{idx}. {s.get('name')}({s.get('ticker')})*"]
+    total = sc.get("total_score")
+    head = f"*{idx}. {s.get('name')}({s.get('ticker')})*"
+    if isinstance(total, (int, float)):
+        head += f" — 종합점수 {total:.3f}"
+    lines = [head, *_plan_lines(ml, ind)]
 
-    # 얼마에 사서 얼마에 파는가 — 전일 종가 기준 예상 목표/손절가(확정은 체결가 기준).
-    base, atr = ml.get("last_actual_price"), ind.get("atr")
-    if isinstance(base, (int, float)) and isinstance(atr, (int, float)) and base > 0 and atr > 0:
-        tp = base + atr * settings.TP_ATR_MULT
-        sl = base - atr * settings.SL_ATR_MULT
-        lines.append(
-            f"기준가 {base:,.0f}원(전일 종가) → 목표 {tp:,.0f}원({(tp / base - 1) * 100:+.1f}%) · "
-            f"손절 {sl:,.0f}원({(sl / base - 1) * 100:+.1f}%)"
-        )
+    # ① ML: 14일 후 예측가와 상승률(확률 아님 — CLAUDE.md §2.2), 후보 진입 기준과 함께.
     rise, future = ml.get("predicted_rise_pct"), ml.get("predicted_future_price")
     if isinstance(rise, (int, float)):
-        future_txt = f" {future:,.0f}원" if isinstance(future, (int, float)) else ""
-        lines.append(f"ML 예측: 14일 후{future_txt} ({rise:+.2f}%)")
-    f_net, i_net = fl.get("foreign_net"), fl.get("institution_net")
-    if f_net is not None or i_net is not None:
+        threshold = ml.get("rise_threshold")
+        base_txt = f" {_won(future)}" if isinstance(future, (int, float)) else ""
+        th_txt = (f", 후보 기준 {threshold:.1f}% 이상" if isinstance(threshold, (int, float)) else "")
+        sub = sc.get("ml_sub")
+        sub_txt = f" → ML점수 {sub:.2f}" if isinstance(sub, (int, float)) else ""
+        lines.append(f"① ML 예측: {settings.ML_FORECAST_DAYS}거래일 후{base_txt} ({rise:+.2f}%{th_txt}){sub_txt}")
+
+    # ② 수급: 외국인·기관 순매수 금액과 쌍끌이 여부(한국 시장 특화 신호).
+    f_net, i_net, flow = fl.get("foreign_net"), fl.get("institution_net"), fl.get("flow_score")
+    if f_net is not None or i_net is not None or flow is not None:
         dual = " · 쌍끌이(외국인+기관 동반 순매수)" if sc.get("dual_buy") else ""
-        lines.append(f"수급(최근 {settings.FLOW_LOOKBACK_DAYS}거래일): "
-                     f"외국인 {_eok(f_net)} · 기관 {_eok(i_net)}{dual}")
-    total = sc.get("total_score")
-    if isinstance(total, (int, float)):
-        subs = " · ".join(
-            f"{label} {sc[k]:.2f}"
-            for k, label in (("ml_sub", "ML"), ("tech_sub", "기술"),
-                             ("flow_sub", "수급"), ("vol_sub", "변동성"))
-            if isinstance(sc.get(k), (int, float))
+        calc = fl.get("flow_calc_date")
+        flow_txt = f", flow_score {flow:+.2f}" if isinstance(flow, (int, float)) else ""
+        sub = sc.get("flow_sub")
+        sub_txt = f" → 수급점수 {sub:.2f}" if isinstance(sub, (int, float)) else ""
+        lines.append(
+            f"② 수급({calc or '최근'} 기준 {settings.FLOW_LOOKBACK_DAYS}거래일 합): "
+            f"외국인 {_eok(f_net)} · 기관 {_eok(i_net)}{dual}{flow_txt}{sub_txt}"
         )
-        lines.append(f"종합점수 {total:.3f}" + (f" ({subs})" if subs else ""))
+
+    # ③ 기술지표 세부항목.
+    tech = _tech_detail(ind)
+    if tech:
+        sub = sc.get("tech_sub")
+        sub_txt = f" → 기술점수 {sub:.2f}" if isinstance(sub, (int, float)) else ""
+        lines.append(f"③ 기술지표: {tech}{sub_txt}")
+
+    # ④ 변동성(ATR%) — 낮을수록 점수가 높다(같은 ATR 배수로 손절폭이 좁아짐).
+    atr_pct, vol_sub = ind.get("atr_pct"), sc.get("vol_sub")
+    if isinstance(atr_pct, (int, float)) or isinstance(vol_sub, (int, float)):
+        pct_txt = f"ATR {atr_pct:.2f}%" if isinstance(atr_pct, (int, float)) else "ATR 비율 미상"
+        sub_txt = f" → 변동성점수 {vol_sub:.2f}" if isinstance(vol_sub, (int, float)) else ""
+        lines.append(f"④ 변동성: {pct_txt}{sub_txt}")
+
+    math = _score_math(sc)
+    if math:
+        lines.append(math)
     if s.get("reason"):
-        lines.append(f"AI 검토: {_clip(s['reason'], 220)}")
+        model = s.get("llm_model")
+        lines.append(f"AI 최종 검토{f'({model})' if model else ''}: {_clip(s['reason'], 320)}")
     return "\n".join(lines)
 
 
@@ -279,6 +370,17 @@ def _buy_summary(details: dict, decision_result: dict, market_blocked: bool) -> 
         lines.append("매수 종목 없음"
                      + (" — VIX 임계 초과로 신규 매수 차단(보수 모드)" if market_blocked
                         else " — 기준 통과 종목 없음(점수 미달·AI 보류)"))
+        # 0건인 날은 '왜 없는지'가 정보다 — AI 검토까지 갔다가 보류된 상위 후보의 사유를 보여준다.
+        reviewed = [h for h in ((details.get("hold") or {}).get("stocks") or [])
+                    if h.get("stage") == "llm_reviewed" and h.get("reason")]
+        reviewed.sort(key=lambda h: (h.get("scores") or {}).get("total_score") or 0, reverse=True)
+        if reviewed:
+            lines.append("")
+            lines.append("보류된 상위 후보")
+            for h in reviewed[:3]:
+                score = (h.get("scores") or {}).get("total_score")
+                score_txt = f" 종합점수 {score:.3f}" if isinstance(score, (int, float)) else ""
+                lines.append(f"• {h.get('name')}({h.get('ticker')}){score_txt} — {_clip(h['reason'], 160)}")
     for i, s in enumerate(stocks, 1):
         lines.append("")
         lines.append(_stock_block(i, s))

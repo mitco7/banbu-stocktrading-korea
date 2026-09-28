@@ -143,6 +143,9 @@ class Settings(BaseSettings):
 
     # ── ml_sub: 예측 상승률 saturating 변환 ──
     ML_RISE_CAP: float = 15.0           # 14일 +15% 이상은 만점(과적합 의심 구간 saturate)
+    # ML 예측 기간(거래일). **kaggle_notebook/predict.py 의 FORECAST_HORIZON 과 반드시 일치**
+    # — 알림 문구 표기에만 쓰지만 값이 어긋나면 잘못된 기간을 안내하게 된다.
+    ML_FORECAST_DAYS: int = 14
 
     # ── tech_sub 내부 가중(합=1.0) + cap ──
     TECH_W_GC: float = 0.30             # 골든크로스
