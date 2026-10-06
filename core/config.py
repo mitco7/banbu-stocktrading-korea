@@ -177,7 +177,9 @@ class Settings(BaseSettings):
     # ML(Kaggle) 완료 대기 폴링 간격(초).
     PIPELINE_ML_POLL_INTERVAL_SEC: float = 30.0
     # ML 완료 대기 상한(초). 초과 시 파이프라인 중단(fail-close — 이후 단계 진행 금지).
-    PIPELINE_ML_TIMEOUT_SEC: float = 900.0  # 15분
+    # 45분 — 2026-10-06 캐글 큐 대기가 길어 push→완료에 37분 걸렸고, 900초(15분)에서 끊겨
+    # 그날 매수 결정이 통째로 사라졌다. 07:00 시작 기준 45분을 기다려도 07:45라 매수(10:00) 전 여유.
+    PIPELINE_ML_TIMEOUT_SEC: float = 2700.0
 
     # ── 스케줄러(Step 7 — services/scheduler, 시각은 전부 KST "HH:MM") ────
     SCHEDULER_ENABLED: bool = True
