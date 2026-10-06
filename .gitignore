@@ -56,3 +56,6 @@ data/
 # 피피티, 마케팅 폴더
 ppt/
 marketing/
+
+# 교정 스크립트 산출물(백업 JSON)
+scripts/out/

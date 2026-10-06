@@ -59,10 +59,14 @@ class Series:
 # ──────────────────────────────────────────────────────────────────────────
 MACRO_MARKET_SERIES: list[Series] = [
     # ── 한국 지수 / 변동성 ────────────────────────────────
+    # 네이버 지수 JSON 이 1순위 — FDR 의 KRX 지수 경로가 2026-09-17 자에서 응답이 멈춰
+    # (같은 FDR 로 개별 종목은 정상) 18영업일간 ffill 고착을 일으켰다. yfinance 는 429 상습.
     Series("KOSPI", "코스피(당일 장마감). 25종목 구성원 — 미래 시프트 금지.",
-           "kr_index", FREQ_DAILY, 0, TIER_REQUIRED, (("fdr", "KS11"), ("yfinance", "^KS11"))),
+           "kr_index", FREQ_DAILY, 0, TIER_REQUIRED,
+           (("naver", "KOSPI"), ("fdr", "KS11"), ("yfinance", "^KS11"))),
     Series("KOSDAQ", "코스닥. 위험선호 프록시.",
-           "kr_index", FREQ_DAILY, 0, TIER_REQUIRED, (("fdr", "KQ11"), ("yfinance", "^KQ11"))),
+           "kr_index", FREQ_DAILY, 0, TIER_REQUIRED,
+           (("naver", "KOSDAQ"), ("fdr", "KQ11"), ("yfinance", "^KQ11"))),
     # VKOSPI 제거(2026-05): FDR/yfinance 미제공·pykrx(KRX) 차단으로 수집 불가 → 컬럼에서 제외.
     #   보수 모드(CLAUDE.md §2.4)의 변동성 게이지는 VIX 로 대용한다(stock-quant 권고).
 
@@ -212,3 +216,9 @@ ALL_DATA_COLUMNS: list[str] = MACRO_MARKET_KEYS + STOCK_CLOSE_COLS + STOCK_VOLUM
 # 날짜 축은 달력일(주말 포함, 정답지 방식). 주말/공휴일은 ffill 로 연장한다.
 # 연속 ffill 길이가 이 값(일)을 초과하면 '의심 데이터 갭'으로 경고(정상 연휴는 통과).
 WARN_FFILL_RUN_DAYS = 10
+
+# 일간 가격형 소스의 '신선도' 허용치(달력일). 소스가 응답은 주는데 마지막 날짜가 수집 기준일보다
+# 이만큼 넘게 과거면 그 소스를 실패로 보고 다음 폴백으로 넘어간다.
+# (2026-10-06: FDR 지수가 응답은 정상이면서 9/17 에 고착 → '수집 OK' 로 기록되고 18일간 ffill)
+# 설·추석 연휴(최장 5~6일) + 주말을 감안해 7일. 더 줄이면 연휴마다 오탐이 난다.
+MAX_SOURCE_STALE_DAYS = 7

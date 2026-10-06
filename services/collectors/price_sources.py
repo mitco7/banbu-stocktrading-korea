@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import time
 
 import pandas as pd
+import requests
 
 from utils.logger import get_logger
 from utils.retry import retry
@@ -161,10 +163,56 @@ def pykrx_index(symbol: str, start: str, end: str) -> pd.Series:
     return _normalize_index(df["종가"].astype("float64"))
 
 
+# 네이버 지수 JSON — 국내 지수(KOSPI/KOSDAQ) 1순위 소스.
+# FDR 의 KRX 지수 경로가 2026-09-17 자에 고착(응답은 정상, 최신 행이 안 늘어남)한 사고로 추가.
+_NAVER_INDEX_URL = (
+    "https://api.finance.naver.com/siseJson.naver"
+    "?symbol={symbol}&requestType=1&startTime={start}&endTime={end}&timeframe=day"
+)
+_NAVER_UA = "Mozilla/5.0"
+
+
+@retry(attempts=2, base_delay=1.5, backoff=2.0)
+def naver_index_close(symbol: str, start: str, end: str) -> pd.Series:
+    """네이버 지수 일별 종가(symbol='KOSPI'|'KOSDAQ').
+
+    응답은 작은따옴표를 쓰는 파이썬 리터럴 형태라 큰따옴표로 바꿔 파싱한다.
+    첫 행은 헤더(['날짜','시가','고가','저가','종가','거래량','외국인소진율']).
+    """
+    url = _NAVER_INDEX_URL.format(
+        symbol=symbol, start=start.replace("-", ""), end=end.replace("-", "")
+    )
+    resp = requests.get(
+        url,
+        headers={"User-Agent": _NAVER_UA, "Referer": "https://finance.naver.com/"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    rows = json.loads(resp.text.strip().replace("'", '"'))
+    if not isinstance(rows, list) or len(rows) < 2:
+        raise RuntimeError(f"네이버 지수 빈 응답: {symbol}")
+
+    dates: list[str] = []
+    closes: list[float] = []
+    for row in rows[1:]:
+        if not isinstance(row, list) or len(row) < 5 or row[4] is None:
+            continue
+        dates.append(str(row[0]))
+        closes.append(float(row[4]))
+    if not dates:
+        raise RuntimeError(f"네이버 지수 파싱 실패: {symbol}")
+
+    series = pd.Series(closes, index=pd.to_datetime(dates, format="%Y%m%d"),
+                       dtype="float64")
+    return _normalize_index(series)
+
+
 def fetch_price_series(
     provider: str, spec, start: str, end: str
 ) -> pd.Series:
     """provider 디스패치. 실패 시 예외를 그대로 올려 호출자가 다음 폴백을 시도."""
+    if provider == "naver":
+        return naver_index_close(spec, start, end)
     if provider == "fdr":
         return fdr_close(spec, start, end)
     if provider == "yfinance":

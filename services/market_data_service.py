@@ -31,9 +31,11 @@ from core.market_spec import (
     FREQ_QUARTERLY,
     FREQ_WEEKLY,
     MACRO_MARKET_SERIES,
+    MAX_SOURCE_STALE_DAYS,
     STOCK_CLOSE_COLS,
     STOCK_CODES,
     STOCK_VOLUME_COLS,
+    TIER_REQUIRED,
     WARN_FFILL_RUN_DAYS,
     Series,
     stock_close_col,
@@ -84,11 +86,27 @@ def _apply_publication_shift(s: pd.Series, freq: str) -> pd.Series:
     return s
 
 
+_PRICE_PROVIDERS = ("naver", "fdr", "yfinance", "pykrx")
+
+
+def _is_stale(series: Series, s: pd.Series, end: str) -> bool:
+    """일간 소스가 응답은 줬지만 마지막 날짜가 기준일보다 한참 과거인가.
+
+    소스가 조용히 고착되는 사고(2026-10-06 FDR 지수)를 '성공'으로 기록하지 않기 위한 판정.
+    주간 이하 저빈도 지표는 발표 시차가 정상이라 제외한다.
+    """
+    if series.freq != FREQ_DAILY or s.empty:
+        return False
+    last = pd.Timestamp(s.index.max()).normalize()
+    return (pd.Timestamp(end).normalize() - last).days > MAX_SOURCE_STALE_DAYS
+
+
 def _fetch_one_series(series: Series, start: str, end: str) -> pd.Series | None:
-    """Series 스펙의 소스를 순서대로 시도해 첫 성공 결과 반환."""
+    """Series 스펙의 소스를 순서대로 시도해 첫 '신선한' 결과 반환."""
+    stale_seen = False
     for provider, spec in series.sources:
         try:
-            if provider in ("fdr", "yfinance", "pykrx"):
+            if provider in _PRICE_PROVIDERS:
                 s = fetch_price_series(provider, spec, start, end)
             elif provider == "ecos":
                 s = fetch_ecos_series(spec, start, end)
@@ -97,11 +115,27 @@ def _fetch_one_series(series: Series, start: str, end: str) -> pd.Series | None:
             else:
                 continue
             if s is not None and not s.empty:
+                # 가격형 소스에만 적용 — FRED/ECOS 거시지표는 발표 지연이 정상이라 제외.
+                if provider in _PRICE_PROVIDERS and _is_stale(series, s, end):
+                    stale_seen = True
+                    logger.warning(
+                        "소스 신선도 미달 %s/%s: 마지막 %s (기준 %s, 허용 %d일) → 다음 소스 시도",
+                        series.key, provider, pd.Timestamp(s.index.max()).date(),
+                        end, MAX_SOURCE_STALE_DAYS,
+                    )
+                    continue
                 logger.info("수집 OK: %s ← %s", series.key, provider)
                 return s
         except Exception as exc:  # noqa: BLE001 — 폴백 목적
             logger.warning("소스 실패 %s/%s: %s", series.key, provider, exc)
-    logger.warning("모든 소스 실패(결측 유지): %s", series.key)
+    if stale_seen and series.tier == TIER_REQUIRED:
+        # 응답은 오지만 전부 과거 데이터 — ffill 로 덮이면 조용히 썩는다. 필수 지표는 에러로.
+        logger.error(
+            "필수 지표 수집 실패 — 모든 소스가 %d일 넘게 과거 데이터만 반환: %s (소스 점검 필요)",
+            MAX_SOURCE_STALE_DAYS, series.key,
+        )
+    else:
+        logger.warning("모든 소스 실패(결측 유지): %s", series.key)
     return None
 
 
