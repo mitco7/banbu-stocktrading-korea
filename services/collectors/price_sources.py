@@ -7,6 +7,7 @@ pykrx 는 본 개발환경에서 KRX 접속이 막혀 있어 실패할 수 있�
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -169,15 +170,22 @@ _NAVER_INDEX_URL = (
     "https://api.finance.naver.com/siseJson.naver"
     "?symbol={symbol}&requestType=1&startTime={start}&endTime={end}&timeframe=day"
 )
-_NAVER_UA = "Mozilla/5.0"
+# flow_service 와 같은 UA — 맨몸 UA 는 차단 1순위라 국내 소스는 동일 UA 로 맞춘다.
+_NAVER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+_NAVER_TIMEOUT = (3.05, 10)  # (connect, read) — 스칼라 타임아웃 분리
 
 
 @retry(attempts=2, base_delay=1.5, backoff=2.0)
 def naver_index_close(symbol: str, start: str, end: str) -> pd.Series:
     """네이버 지수 일별 종가(symbol='KOSPI'|'KOSDAQ').
 
-    응답은 작은따옴표를 쓰는 파이썬 리터럴 형태라 큰따옴표로 바꿔 파싱한다.
     첫 행은 헤더(['날짜','시가','고가','저가','종가','거래량','외국인소진율']).
+    응답은 JSON 이 아니라 작은따옴표와 파이썬 None 을 쓰는 리터럴이고 charset 헤더도 없다(EUC-KR).
+    따옴표 치환 + json.loads 는 None 토큰 하나에 전체가 깨지므로 literal_eval 로 읽는다
+    (리터럴만 평가 — 코드 실행 위험 없음). 네이버가 정식 JSON 으로 바꾸면 json 으로 재시도.
     """
     url = _NAVER_INDEX_URL.format(
         symbol=symbol, start=start.replace("-", ""), end=end.replace("-", "")
@@ -185,10 +193,14 @@ def naver_index_close(symbol: str, start: str, end: str) -> pd.Series:
     resp = requests.get(
         url,
         headers={"User-Agent": _NAVER_UA, "Referer": "https://finance.naver.com/"},
-        timeout=10,
+        timeout=_NAVER_TIMEOUT,
     )
     resp.raise_for_status()
-    rows = json.loads(resp.text.strip().replace("'", '"'))
+    text = resp.content.decode("euc-kr", errors="replace").strip()
+    try:
+        rows = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        rows = json.loads(text)
     if not isinstance(rows, list) or len(rows) < 2:
         raise RuntimeError(f"네이버 지수 빈 응답: {symbol}")
 

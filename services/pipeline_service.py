@@ -446,6 +446,15 @@ def run_daily_pipeline(force_market: bool = False, skip_ml: bool = False) -> dic
         market_result = market_data_service.update_market_data(force=force_market)
     except Exception as exc:  # noqa: BLE001 — 단계 실패를 응답으로 전달(fail-close)
         return _fail(1, "market_collect", str(exc))
+    missing = market_result.get("required_missing") or []
+    if missing:
+        # 필수 일간 지표(KOSPI/KOSDAQ 등)의 모든 소스가 실패하거나 과거 데이터만 반환한 경우.
+        # 그대로 두면 하류 ML 노트북의 ffill 이 직전 고착값으로 메워 오염을 숨긴다
+        # (2026-10-06 FDR 지수 고착 사고) → 여기서 중단한다.
+        return _fail(1, "market_collect",
+                     f"필수 일간 지표 수집 실패: {', '.join(missing)} — "
+                     f"소스 점검 필요. ML 피처 오염 방지로 중단(fail-close)",
+                     market_result)
     steps.append({"step": 1, "name": "market_collect", "status": "ok", "result": market_result})
 
     # ── 2단계: 수급 수집 ─────────────────────────────────

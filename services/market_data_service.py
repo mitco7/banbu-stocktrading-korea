@@ -139,12 +139,18 @@ def _fetch_one_series(series: Series, start: str, end: str) -> pd.Series | None:
     return None
 
 
-def collect_market_data(start: str, end: str) -> pd.DataFrame:
+def collect_market_data(start: str, end: str,
+                        missing_out: list[str] | None = None) -> pd.DataFrame:
     """[start, end] 구간 시장데이터 와이드 DataFrame 수집.
 
     index = 달력일(date, 주말 포함), columns = ALL_DATA_COLUMNS. 결측은 ffill 규칙대로 처리됨.
     주말/공휴일은 직전 거래일 값으로 ffill 연장된다(정답지 방식). 구간 시작이 주말/공휴일이어도
     선두 행이 비지 않도록, 일간/종목을 구간 시작 전 버퍼까지 수집해 채운 뒤 실제 구간으로 잘라낸다.
+
+    missing_out: 리스트를 주면 '필수(TIER_REQUIRED) 일간 지표인데 모든 소스가 실패/신선도 미달'인
+      컬럼명을 담아 돌려준다. 호출자(파이프라인)가 fail-close 판단에 쓴다.
+      ⚠ 이 결측을 그냥 두면 하류 ML 노트북의 ffill 이 '직전 고착값'으로 메워 버려서,
+        수집 단계에서 막지 않으면 오염을 탐지할 수 없다(2026-10-06 FDR 지수 고착 사고).
     """
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
     if end_ts < start_ts:
@@ -169,6 +175,9 @@ def collect_market_data(start: str, end: str) -> pd.DataFrame:
         if s is not None:
             s = _apply_publication_shift(s, series.freq)
         if s is None:
+            if (missing_out is not None and series.tier == TIER_REQUIRED
+                    and series.freq == FREQ_DAILY):
+                missing_out.append(series.key)
             frame[series.key] = np.nan
         elif series.freq == FREQ_DAILY:
             # 일간: 거래일 값을 달력일 그리드에 정렬(이후 ffill_grid 로 주말/공휴일·선두 연장).
@@ -234,10 +243,13 @@ def save_market_data(df: pd.DataFrame) -> dict[str, int]:
     return result
 
 
-def collect_and_save(start: str, end: str) -> dict[str, int]:
-    """수집 + 저장 일괄."""
-    df = collect_market_data(start, end)
-    return save_market_data(df)
+def collect_and_save(start: str, end: str) -> dict:
+    """수집 + 저장 일괄. 필수 일간 지표 결측 목록(required_missing)을 함께 돌려준다."""
+    missing: list[str] = []
+    df = collect_market_data(start, end, missing_out=missing)
+    result = dict(save_market_data(df))
+    result["required_missing"] = missing
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -332,4 +344,5 @@ def update_market_data(force: bool = False) -> dict:
     logger.info("증분 수집: %s ~ %s (force=%s)", start_date, end_str, force)
     result = collect_and_save(start_date, end_str)
     return {"status": "collected", "start": start_date, "end": end_str,
-            "upserted": result["upserted"]}
+            "upserted": result["upserted"],
+            "required_missing": result.get("required_missing", [])}
