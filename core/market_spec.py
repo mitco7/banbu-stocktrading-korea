@@ -202,23 +202,25 @@ STOCK_VOLUME_COLS: list[str] = [stock_volume_col(c) for c in STOCK_CODES]
 MACRO_MARKET_KEYS: list[str] = [s.key for s in MACRO_MARKET_SERIES]
 SERIES_BY_KEY: dict[str, Series] = {s.key: s for s in MACRO_MARKET_SERIES}
 
-# 일간(가격) 컬럼: ffill 연속 한도 적용 대상.
+# 일간(가격) 컬럼: 영업일 그리드 위 ffill 한도 적용 대상(종가·일간 지수/환율 등).
+# 거래량은 당일 실측 — DAILY_FFILL_KEYS 에 넣지 않는다(CLAUDE.md §2.1).
 DAILY_FFILL_KEYS: list[str] = (
     [s.key for s in MACRO_MARKET_SERIES if s.freq == FREQ_DAILY]
     + STOCK_CLOSE_COLS
-    + STOCK_VOLUME_COLS
 )
 # 저빈도(거시) 컬럼: 발표일까지 ffill(한도 미적용).
 SLOW_FFILL_KEYS: list[str] = [s.key for s in MACRO_MARKET_SERIES if s.freq in SLOW_FREQS]
 
 ALL_DATA_COLUMNS: list[str] = MACRO_MARKET_KEYS + STOCK_CLOSE_COLS + STOCK_VOLUME_COLS
 
-# 날짜 축은 달력일(주말 포함, 정답지 방식). 주말/공휴일은 ffill 로 연장한다.
-# 연속 ffill 길이가 이 값(일)을 초과하면 '의심 데이터 갭'으로 경고(정상 연휴는 통과).
-WARN_FFILL_RUN_DAYS = 10
+# 날짜 축 = KRX 영업일만(주말·휴장일 행 없음, CLAUDE.md §2.1 / 2026-10-27 개정).
+# 영업일 그리드에서 연속 ffill 허용 한도. 초과 구간은 NaN 유지 + 갭 경고.
+FFILL_LIMIT_BUSINESS_DAYS = 3
+# 하위 호환 별칭(이전 달력일 warn 상수명). 신규 코드는 FFILL_LIMIT_BUSINESS_DAYS 사용.
+WARN_FFILL_RUN_DAYS = FFILL_LIMIT_BUSINESS_DAYS
 
 # 일간 가격형 소스의 '신선도' 허용치(달력일). 소스가 응답은 주는데 마지막 날짜가 수집 기준일보다
 # 이만큼 넘게 과거면 그 소스를 실패로 보고 다음 폴백으로 넘어간다.
-# (2026-10-06: FDR 지수가 응답은 정상이면서 9/17 에 고착 → '수집 OK' 로 기록되고 18일간 ffill)
-# 설·추석 연휴(최장 5~6일) + 주말을 감안해 7일. 더 줄이면 연휴마다 오탐이 난다.
+# (2026-10-06: FDR 지수가 응답은 정상이면서 9/17 에 고착 → '수집 OK' 로 기록되고 장기 ffill)
+# 설·추석 연휴(최장 5~6 달력일)를 감안해 7일. 더 줄이면 연휴마다 오탐이 난다.
 MAX_SOURCE_STALE_DAYS = 7

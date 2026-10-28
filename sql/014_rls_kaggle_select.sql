@@ -9,10 +9,13 @@
 -- 노출 범위: ML 예측 산출물 2개 테이블의 읽기만 추가로 허용한다. 시크릿·포지션이 없는
 --   데이터이며, access_tokens·trade_records·decision_logs 등 민감 테이블은 계속 전면 차단.
 --
+-- 멱등: DROP POLICY IF EXISTS 후 CREATE (재실행 시 42710 방지).
 -- ⚠ Supabase SQL Editor 에서 수동 실행(sql/001~013 과 동일 방식).
 
+DROP POLICY IF EXISTS kaggle_read_pred ON predicted_stocks;
 CREATE POLICY kaggle_read_pred ON predicted_stocks
     FOR SELECT TO anon USING (true);
 
+DROP POLICY IF EXISTS kaggle_read_analysis ON stock_analysis_results;
 CREATE POLICY kaggle_read_analysis ON stock_analysis_results
     FOR SELECT TO anon USING (true);

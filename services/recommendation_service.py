@@ -9,7 +9,7 @@
     4) 날짜(추천 산출일) + 모든 지표/근거를 stock_recommendations 에 멱등 저장.
 
 ⚠ 종합점수 가중합·LLM 검토는 다음 스텝(여기선 지표 계산 + 후보 저장까지만 — 요구사항 [하지 말 것]).
-⚠ 지표는 market_data 가 아닌 FDR 일봉으로 계산(market_data 는 종가만/주말 ffill → ATR/ADX 불가·잡음).
+⚠ 지표는 market_data 가 아닌 FDR 일봉으로 계산(market_data 는 종가 위주·OHLC 없음 → ATR/ADX 불가).
 """
 
 from __future__ import annotations

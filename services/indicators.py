@@ -1,9 +1,8 @@
 """기술적 지표 — 순수 함수 (Step 4: 매수 후보용).
 
 입력은 **실제 거래일만** 인덱싱된 일봉 시계열이어야 한다(주말·공휴일·ffill 더미 제외).
-  - market_data 와이드 테이블은 달력일 그리드(주말 ffill)라 per-종목 지표에 부적합하고,
-    종가만 있어 ATR/ADX(고·저가 필요)를 계산할 수 없다.
-  - 따라서 호출자(recommendation_service)는 FDR 일봉 OHLCV(거래일만 반환)를 입력으로 준다.
+  - market_data 는 영업일 축·종가 위주라 ATR/ADX(고·저가 필요)에 부적합하다.
+  - 호출자(recommendation_service)는 FDR 일봉 OHLCV(거래일만)를 입력으로 준다.
     이로써 "주말/공휴일 제외"와 RSI 의 "ffill 변동0 날 제외"가 입력 단계에서 자연히 충족된다.
 
 평활(Wilder, RSI/ATR/ADX): Wilder 의 RMA(=alpha 1/n 지수평활, 단 표준 시딩).

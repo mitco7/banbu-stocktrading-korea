@@ -10,7 +10,8 @@ KOSPI/KOSDAQ 가 같은 값으로 ffill 고착됐다. 멱등 저장(upsert_fill_
   python scripts/fix_kr_index.py                        # 2026-09-17 ~ 오늘 교정
   python scripts/fix_kr_index.py --start 2026-09-17 --end 2026-10-06
 
-휴장일·주말은 직전 거래일 값으로 채운다(수집기의 달력일 ffill 규칙과 동일).
+날짜 축은 KRX 영업일만(주말·휴장 제외, CLAUDE.md §2.1). DB 에 남아 있는 비영업일 행은
+이 스크립트가 건드리지 않는다(영업일 행만 갱신).
 실행 전 현재 값을 JSON 으로 백업한다(기본 scripts/out/).
 """
 
@@ -27,6 +28,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.market_calendar import trading_day_range  # noqa: E402
 from core.market_spec import DATE_COL  # noqa: E402
 from db.client import get_supabase  # noqa: E402
 from services.collectors.price_sources import naver_index_close  # noqa: E402
@@ -37,14 +39,16 @@ COLS = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ"}  # market_data 컬럼명 ← 네�
 
 
 def build_truth(start: str, end: str) -> pd.DataFrame:
-    """네이버 종가를 달력일 그리드로 펴서 (날짜 × KOSPI/KOSDAQ) 반환."""
-    grid = pd.date_range(start=start, end=end, freq="D")
-    out = pd.DataFrame(index=grid)
-    # 선두 행이 휴일이어도 채워지도록 2주 앞에서부터 받아온다.
+    """네이버 종가를 KRX 영업일 그리드로 펴서 (날짜 × KOSPI/KOSDAQ) 반환."""
+    spine = trading_day_range(start, end)
+    out = pd.DataFrame(index=spine)
+    # 구간 첫 영업일 직전 관측을 쓰기 위해 2주 앞에서부터 받아온다.
     fetch_start = (pd.Timestamp(start) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
     for col, symbol in COLS.items():
         s = naver_index_close(symbol, fetch_start, end)
-        out[col] = s.reindex(out.index.union(s.index)).ffill().reindex(out.index)
+        # 소스 거래일 → 영업일 spine. 선두만 직전값으로 한 칸 메울 수 있게 버퍼 포함 ffill 후 절단.
+        aligned = s.reindex(s.index.union(spine)).sort_index().ffill().reindex(spine)
+        out[col] = aligned
     return out
 
 
@@ -71,8 +75,13 @@ def main() -> int:
         return 1
 
     truth = build_truth(args.start, args.end)
-    print(f"네이버 수집: {args.start} ~ {args.end} — {len(truth)}행 "
-          f"(마지막 {truth.index[-1].date()} KOSPI {truth['KOSPI'].iloc[-1]:,.2f})")
+    if len(truth) == 0:
+        print(f"네이버 수집: {args.start} ~ {args.end} — 영업일 0행")
+    else:
+        print(
+            f"네이버 수집: {args.start} ~ {args.end} — 영업일 {len(truth)}행 "
+            f"(마지막 {truth.index[-1].date()} KOSPI {truth['KOSPI'].iloc[-1]:,.2f})"
+        )
 
     client = get_supabase()
     resp = (client.table(TABLE)
@@ -95,7 +104,7 @@ def main() -> int:
     for row in rows:
         d = pd.Timestamp(row[DATE_COL])
         if d not in truth.index:
-            continue
+            continue  # 레거시 주말·휴장 행 또는 spine 밖 — 건너뜀
         patch = {}
         for col in COLS:
             new = truth.at[d, col]

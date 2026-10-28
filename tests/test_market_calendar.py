@@ -46,3 +46,35 @@ def test_market_hours_boundaries():
     assert not mc.is_market_hours(_day("2026-09-28", "08:59"))
     assert not mc.is_market_hours(_day("2026-09-28", "15:31"))
     assert not mc.is_market_hours(_day("2026-09-25", "10:00"))  # 휴장일은 장중이어도 False
+
+
+def test_trading_day_range_excludes_weekend_and_chuseok():
+    """영업일 spine 에 토·일·추석 휴장이 없어야 한다(market_data 날짜 축)."""
+    idx = mc.trading_day_range("2026-09-23", "2026-09-29")
+    days = {d.strftime("%Y-%m-%d") for d in idx}
+    assert "2026-09-23" in days  # 수(거래일)
+    assert "2026-09-28" in days  # 월(거래일)
+    assert "2026-09-29" in days  # 화
+    assert "2026-09-24" not in days  # 추석
+    assert "2026-09-25" not in days
+    assert "2026-09-26" not in days  # 토
+    assert "2026-09-27" not in days  # 일
+
+
+def test_holidays_cover_backfill_era():
+    """백필 시작(2010)부터 현재 운용연도까지 평일 휴장이 등록돼 있어야 한다."""
+    assert "2010-01-01" in mc.KRX_HOLIDAYS
+    assert "2011-02-03" in mc.KRX_HOLIDAYS  # 설날(mondovisione 2011 공지와 일치)
+    assert "2024-05-01" in mc.KRX_HOLIDAYS  # 근로자의 날
+    assert "2026-05-01" in mc.KRX_HOLIDAYS
+    assert "2026-06-03" in mc.KRX_HOLIDAYS  # 지방선거(수동 보강)
+    assert "2027-01-01" in mc.KRX_HOLIDAYS
+    assert len(mc.KRX_HOLIDAYS) >= 250
+
+
+def test_2010_january_trading_days_exclude_new_year():
+    idx = mc.trading_day_range("2010-01-01", "2010-01-05")
+    days = [d.strftime("%Y-%m-%d") for d in idx]
+    assert "2010-01-01" not in days  # 신정(금)
+    assert "2010-01-04" in days  # 월
+    assert "2010-01-05" in days

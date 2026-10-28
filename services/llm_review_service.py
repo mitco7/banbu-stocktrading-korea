@@ -23,10 +23,10 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 모델 폴백 순서(스펙). 모델 ID 는 시크릿 아님.
-LLM_MODELS = ("claude-opus-4-8", "claude-sonnet-4-6")
+LLM_MODELS = ("claude-opus-4-8", "claude-sonnet-5")
 # temperature 를 받는 모델만 명시(allow-list). opus-4-8/4.7·fable 계열은 sampling 파라미터 400.
 # (음수조건 `!= opus-4-8` 은 새 모델 추가 시 잘못 temperature 를 보내 400 → 스킵될 위험.)
-_TEMPERATURE_OK = {"claude-sonnet-4-6"}
+_TEMPERATURE_OK = set()
 _MAX_RETRIES = 3
 _BASE_DELAY = 2.0      # 지수 백오프 기준(초)
 _MAX_TOKENS = 2000

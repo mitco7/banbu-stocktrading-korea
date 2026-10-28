@@ -177,8 +177,11 @@ GET  /flow/scores      → 최근 기준일 종목별 flow_score 스냅샷
 ### 데이터 무결성 핵심 (`core/market_spec.py`)
 
 - **컬럼명=한글** (정답지 미국 시스템 패턴): 날짜=`"날짜"`, 종목 종가=한글 종목명(`"삼성전자"`=TARGET_COLUMNS), 거래량=`"삼성전자_거래량"`, 거시/지수=한글 지표명. ML 이 `data["삼성전자"]`처럼 직접 인덱싱하므로 컬럼명을 한글로 맞춤(타입 FLOAT8).
-- **날짜 축=달력일(주말 포함, 정답지 방식).** 주말/공휴일은 직전 거래일 값으로 연속 ffill(거래량 포함). 연속 10일 초과 ffill만 '의심 갭'으로 경고. **거래일 행은 실제 값, 주말/공휴일 행은 ffill 연장값.**
-- **결측은 ffill 만**(bfill/mean/0 금지). 거시는 발표일까지 ffill.
+- **날짜 축=KRX 영업일만** (`core/market_calendar`: 주말·한국 휴장일 제외).
+  주말/휴장일 행을 만들고 ffill로 채우지 **않는다**(2026-10-27 개정 — 이전 ‘달력일+주말 ffill’ 폐기).
+- **결측은 영업일 그리드 위 ffill만**(bfill/mean/0 금지). 연속 **3영업일** 초과 ffill은 데이터 갭 + 알림.
+  해외 지수 등이 한국 영업일에 비는 경우(상대국 휴장)에만 직전 영업일 값 ffill.
+  **거래량은 결측 시 NULL**(직전일 거래량 ffill 금지). 거시(저빈도)는 발표일 기준을 영업일에 맞춰 유지·ffill.
 - **look-ahead 방지:** 해외 시장 컬럼(미국 지수·금리·달러·유가)은 ML 피처 빌더에서 **t-1 시프트** 필요. ECOS 월간 지표는 발표 시차로 **+1개월 보수 시프트**되어 저장됨.
 - **VKOSPI 제외:** FDR/yfinance 미제공 + pykrx(KRX) 차단으로 수집 불가 → 컬럼에서 제거함. 보수 모드(CLAUDE.md §2.4)의 변동성 게이지는 **VIX 로 대용**.
 
@@ -211,7 +214,7 @@ GET  /ml/status       → {status}             # queued/running/complete/error
 완료까지 대기: `ml_trigger_service.trigger_and_wait()` (push → complete 폴링).
 
 > `predict.py` 가 커밋 원본이고, `predict.ipynb` 는 push 시 **시크릿 주입본으로 덮어써져** `.gitignore` 됨.
-> ⚠ **bfill 주의**: 참고 코드의 `df.ffill().bfill()` 를 그대로 유지했는데, 미국 종목은 상장이력이 길어 무해했지만 **한국 신상장 종목(에코프로머티 2023, LG엔솔 2022 등)은 상장 전 구간을 미래값으로 backfill → look-ahead** 가 된다. 향후 학습 시작일을 전 종목 상장 이후로 자르거나 bfill 을 제거하는 보정 권장(CLAUDE.md §2.1).
+> ⚠ **bfill 제거됨**(CLAUDE.md §2.1): `predict.py` 는 `ffill` 만 사용. 신상장 종목 상장 전 구간은 NaN → `dropna` 로 학습 시작이 자연히 뒤로 밀린다.
 
 ---
 
@@ -219,7 +222,7 @@ GET  /ml/status       → {status}             # queued/running/complete/error
 
 - **모의투자가 기본값.** 실전 전환은 별도 의사결정 단계로만.
 - **LLM 검토 실패 시 매수 차단(fail-close).** LLM은 거부권만, 신규 종목 추가 불가.
-- **결측치는 ffill만 허용.** look-ahead bias 금지.
+- **시계열은 영업일만 저장. 결측은 ffill만 허용**(주말·휴장 ffill 행 금지). look-ahead bias 금지.
 - **종목 유니버스 교체는 수동.** 자동 교체 코드 없음.
 - 일일 잡은 **멱등** — 같은 날짜로 두 번 돌려도 안전. 주문은 중복 금지.
 

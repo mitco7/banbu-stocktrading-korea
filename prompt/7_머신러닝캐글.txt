@@ -9,9 +9,12 @@ stock_analysis_results, predicted_stocks 테이블을 만들어야 될거야. dd
   각 Dense(64) → 두 흐름 Add → Dense(128) → Dropout(0.2) → GlobalAveragePooling1D → Dense(25)
 - 하이퍼파라미터: LOOKBACK=90, FORECAST_HORIZON=14, EPOCHS=50, BATCH_SIZE=32, LR=0.0001,
   num_heads=8, ff_dim=256
-- 데이터: Supabase market_data 전체 로드(페이지네이션 1000행 단위) → ffill → MinMaxScaler
-  (종목용/거시용 스케일러 분리) → 슬라이딩 윈도우로 학습셋 생성
-- 개선사항(기존 흔한 실수 방지): validation_split=0.2, 랜덤시드 고정, EarlyStopping 적용
+- 데이터: Supabase market_data 전체 로드(페이지네이션 1000행 단위)
+  → **비영업일(주말) 행 제거**(레거시 달력일 호환; 수집기는 영업일만 저장)
+  → **ffill만**(bfill 금지 — 신상장 종목 상장 전 look-ahead). LOOKBACK=90·FORECAST=14는 **영업일 행** 기준
+  → MinMaxScaler(종목용/거시용 분리) → 슬라이딩 윈도우로 학습셋 생성
+- 개선사항(기존 흔한 실수 방지): validation_split=0.2, 랜덤시드 고정, EarlyStopping 적용,
+  미국 정답지 `ffill().bfill()` 복제 금지
 
 [출력 & 저장]
 - 마지막 시점 기준 14일 후 예측가를 역변환(inverse_transform)으로 실제 가격 복원

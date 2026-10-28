@@ -1,10 +1,11 @@
 기술적 지표를 계산하고 수급 팩터와 결합해, 매수 후보 데이터를 만든다.
-- 참고로, 주말, 공휴일 데이터는 반드시 제외하고 데이터를 처리해야되.
+- 주말·공휴일(KRX 휴장) 데이터는 반드시 제외한다. market_data 도 **영업일 축**이므로 지표 입력은
+  FDR 거래일 OHLCV를 쓰고, 달력일/주말 ffill 더미를 지표에 넣지 않는다(CLAUDE.md §2.1).
 
-[기술적 지표 — market_data의 종가/거래량으로 계산]
+[기술적 지표 — FDR 일봉 OHLCV(거래일만)로 계산; market_data는 종가 위주라 ATR/ADX에 부적합]
 - SMA: 20일/50일 단순이동평균. 골든크로스 = SMA20 > SMA50.
 - RSI(14, Wilder 방식): gain/loss를 ewm(alpha=1/14)로 평활. 단, ffill로 채워진 "변동 0"인 날은
-  제외하고 계산(가짜 거래일이 RSI를 50으로 수렴시키는 문제 방지).
+  제외하고 계산(가짜 거래일이 RSI를 50으로 수렴시키는 문제 방지 — 영업일 입력이면 해당 없음).
 - MACD(12, 26, 9): EMA12 - EMA26, signal = EMA9(MACD). 매수신호 = MACD > Signal.
 - ATR(14, Wilder): True Range의 14일 Wilder 평활.
 - ADX(14, Wilder): +DI/-DI → DX → 14일 Wilder 평활.

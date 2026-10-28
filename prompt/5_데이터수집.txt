@@ -36,11 +36,13 @@ FastAPI Controller로 구현하고, Biz 로직은 services 내에 구현한다.
   - 정답지 US ECONOMIC_FEATURES(37)에서 SPY/QQQ(지수와 중복)만 제외하고 대부분 채택 + KR 레이어(KOSPI/KOSDAQ/
     VKOSPI/원달러·엔원/SOX/한국 거시 5종) 추가. 컬럼명은 한글(예: '미국 소비자물가지수' vs 한국 '한국 소비자물가지수'로 구분).
   - 데이터 무결성은 지표 수와 무관하게 유지: 저빈도(주/월/분기)는 발표시차 한 주기 보수 시프트(누수 방지), bfill 금지.
+  - [변경 5][2026-10-27] 날짜 축 = **KRX 영업일만**(주말·한국 휴장일 행 없음). 정답지 달력일+주말 ffill은 폐기.
+    휴장 목록=core/market_calendar.KRX_HOLIDAYS(백필 시작연도 2010~ 수동 관리).
 
 [DB 스키마]  sql/ 폴더 (scripts/gen_schema_sql.py 가 spec/universe 로부터 자동 생성)
-1. sql/001_market_data.sql — market_data 와이드 테이블(날짜별 1행).
+1. sql/001_market_data.sql — market_data 와이드 테이블(**KRX 영업일당 1행**).
    [변경 2] 컬럼명 = 한글 (정답지 economic_and_stock_data 패턴, ML 드롭인 호환). 타입 FLOAT8. 모든 식별자 큰따옴표 인용.
-     - 날짜 컬럼 = "날짜" (DATE PRIMARY KEY)
+     - 날짜 컬럼 = "날짜" (DATE PRIMARY KEY) — 영업일만 저장, 주말/휴장 행 생성 금지
      - 거시/지수/환율 = 한글 지표명("KOSPI","원/달러 환율","한국 기준금리" 등)
      - 25종목 종가 = 한글 종목명("삼성전자" ...) = ML TARGET_COLUMNS
      - 25종목 거래량 = "<종목명>_거래량"("삼성전자_거래량" ...)  ※ 정답지엔 없으나 사용자 요구
@@ -54,11 +56,13 @@ FastAPI Controller로 구현하고, Biz 로직은 services 내에 구현한다.
 README에 sql 3개 실행 순서 + RLS 안내를 남긴다.
 
 [수집 함수]  services/market_data_service.py
- - collect_market_data(start, end): 위 소스들을 날짜 기준 outer join → 결측은 ffill만.
-   · bfill/mean/0 금지(look-ahead). [주의] 정답지 ML 로더는 ffill().bfill()을 쓰지만 그 bfill은 누수이므로 따르지 않는다.
-   · 거시(월/비정기): 발표일까지 ffill. ECOS 월간은 발표시차 +1개월 보수 시프트(정답지는 미보정=누수, 우리는 회피).
-   · 일간 가격: 연속 3일 한도 ffill(초과 시 데이터 갭 분류+알림, CLAUDE.md §2.1). 거래량은 ffill 안 함(휴장일 날조 방지).
-   · [변경 4] 해외 시장 컬럼은 KST 영업일 기준 join 시 look-ahead → ML 피처 빌더에서 t-1 shift(저장은 원본 네이티브 날짜).
+ - collect_market_data(start, end): 소스를 **KRX 영업일 spine**(`trading_day_range`)에 정렬 → 결측은 ffill만.
+   · 주말·휴장일 행을 만들지 않는다(관측이 아닌 직전일 복사본 ffill 금지).
+   · bfill/mean/0 금지(look-ahead). 정답지 ML 로더의 ffill().bfill() 도 따르지 않는다(bfill=누수).
+   · 거시(월/비정기): 영업일 그리드 위 발표일까지 ffill. ECOS 월간은 발표시차 +1개월 보수 시프트.
+   · 일간 종가/지수: 연속 **3영업일** 한도 ffill(초과 시 갭+알림, CLAUDE.md §2.1).
+   · 거래량: 결측 시 NULL(ffill 금지 — 당일 실측 날조 방지).
+   · [변경 4] 해외 시장 컬럼은 KST 영업일 join 시 look-ahead → ML 피처 빌더에서 t-1 shift(저장은 원본 날짜).
  - 멱등 저장(save_market_data → repo.upsert_fill_empty → RPC): 이미 있는 날짜는 빈 컬럼만 채움, 없으면 insert. 두 번 돌려도 안전.
 
 [과거 백필]  scripts/backfill.py (수동 실행)
@@ -72,12 +76,12 @@ README에 sql 3개 실행 순서 + RLS 안내를 남긴다.
  - 검증 출력에서 날짜 범위와 25종목 종가(한글 컬럼)가 채워졌음을 확인.
 
 [리뷰]
- - 작성 후 backend-reviewer로 수집/저장의 멱등성·ffill·에러처리·시크릿 마스킹을 점검(완료).
+ - 작성 후 backend-reviewer로 수집/저장의 멱등성·영업일 spine·ffill 한도·에러처리·시크릿 마스킹을 점검.
 
 [정답지(banbu-stocktrading-final) 정렬 요약]
- - 채택: 단일 와이드 테이블, 한글 컬럼명, 멱등 fill-empty 저장, 발표주기 일간 resample+ffill.
- - 복제 금지(정답지 결함): ① FRED 키 하드코딩(stock.py) ② ML 로더 bfill(누수) ③ 거시 발표시차 미보정(누수).
-   → 우리는 .env 시크릿, ffill-only, ECOS 발표일 시프트로 회피.
- - 우리 추가: 거래량 저장, RLS 비활성화 SQL, 멀티소스 폴백.
- - 날짜 축: 달력일(주말 포함, 정답지 방식). 주말/공휴일은 직전 거래일 값으로 연속 ffill,
-   연속 10일 초과 ffill만 '의심 데이터 갭'으로 경고(정상 연휴 통과). 거래일 행은 실제 값(검증 통과).
+ - 채택: 단일 와이드 테이블, 한글 컬럼명, 멱등 fill-empty 저장, 저빈도 발표주기 ffill.
+ - 복제 금지(정답지 결함): ① FRED 키 하드코딩 ② ML 로더 bfill(누수) ③ 거시 발표시차 미보정(누수)
+   ④ **달력일+주말/휴장 ffill**(가짜 0변동 행 → ML 잡음). → 우리는 .env 시크릿, ffill-only,
+   ECOS 발표일 시프트, **KRX 영업일 spine**으로 회피.
+ - 우리 추가: 거래량 저장(결측=NULL), RLS 비활성화 SQL, 멀티소스 폴백, market_calendar 휴장(2010~).
+ - 날짜 축(확정): **KRX 영업일만**. 주말·휴장 행 없음. 영업일 결측만 3영업일 한도 ffill.

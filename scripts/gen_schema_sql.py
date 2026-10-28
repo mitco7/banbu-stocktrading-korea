@@ -44,9 +44,11 @@ def q(name: str) -> str:
 
 def build_create_sql() -> str:
     lines: list[str] = []
-    lines.append(f"-- {TABLE}: 시장데이터 와이드 테이블 (날짜별 1행).")
+    lines.append(f"-- {TABLE}: 시장데이터 와이드 테이블 (KRX 영업일당 1행).")
     lines.append("-- 자동 생성: scripts/gen_schema_sql.py (직접 편집 금지).")
     lines.append(f"-- 유니버스 기준일(SELECTED_AT): {SELECTED_AT}")
+    lines.append("-- 날짜 축: KRX 영업일만(주말·휴장일 행 없음). 휴장 목록=core/market_calendar.KRX_HOLIDAYS.")
+    lines.append("--          결측은 영업일 그리드 위 ffill만(CLAUDE.md §2.1). 거래량 결측은 NULL.")
     lines.append(f"-- 컬럼 단위: 모두 {COL_TYPE}. 결측은 NULL(상장 전 구간·미수집 지표 등).")
     lines.append("-- 컬럼명=한글(ML 의 TARGET_COLUMNS/ECONOMIC_FEATURES 와 직접 매칭).")
     lines.append("-- ⚠ 해외 시장 컬럼은 t-1 lag, 거시는 발표일 시프트가 ML 피처 단계에서 필요(core/market_spec.py).")

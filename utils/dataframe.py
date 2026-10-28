@@ -1,7 +1,8 @@
-"""결측 처리 헬퍼 — ffill(전일치 보간) 전용 (CLAUDE.md §2.1).
+"""결측 처리 헬퍼 — ffill(직전 영업일 값 보간) 전용 (CLAUDE.md §2.1).
 
 bfill / mean / median / 0 채움은 **금지**. 미래값으로 과거를 채우면 look-ahead bias.
-일간 가격 컬럼은 연속 ffill 한도를 두고, 초과 구간은 '데이터 갭'으로 분류해 알린다.
+날짜 축은 KRX 영업일 그리드여야 한다(주말·휴장일 행을 만들어 ffill하지 말 것).
+일간 가격 컬럼은 연속 ffill 한도(영업일)를 두고, 초과 구간은 '데이터 갭'으로 분류해 알린다.
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ def ffill_only(df: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFra
 def ffill_limited(
     df: pd.DataFrame, columns: list[str], limit: int
 ) -> tuple[pd.DataFrame, dict[str, int], dict[str, int]]:
-    """일간 가격 컬럼을 한도(limit) 거래일까지만 ffill.
+    """일간 가격 컬럼을 한도(limit) 영업일까지만 ffill.
 
     한도를 초과한 연속 결측 구간이 있으면 컬럼별 '갭 길이 최대값'을 반환하고,
     데이터 신뢰도 사후 감사를 위해 **컬럼별 ffill 로 채운 셀 수**도 반환한다.
+    입력 index 는 영업일만이어야 한다(달력일+주말 행이면 한도 의미가 왜곡됨).
 
     Returns:
         (보간된 DataFrame,
@@ -48,7 +50,7 @@ def ffill_limited(
             filled_counts[c] = n_filled
         # 원본이 결측이고 한도 ffill 후에도 여전히 결측인 위치 = 한도 초과 갭.
         over_gap = col.isna() & filled.isna()
-        # 첫 관측 이전의 선두 결측(상장 전 구간·구간 첫 휴장일 등)은 갭이 아니다 — 제외.
+        # 첫 관측 이전의 선두 결측(상장 전 구간)은 갭이 아니다 — 제외.
         first_valid = col.first_valid_index()
         if first_valid is not None:
             over_gap.loc[:first_valid] = False
@@ -61,31 +63,13 @@ def ffill_limited(
 def ffill_grid(
     df: pd.DataFrame, columns: list[str], warn_run: int
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """달력일 그리드용 연속 ffill (주말/공휴일 연장).
+    """영업일 그리드용 ffill — `ffill_limited` 래퍼(하위 호환).
 
-    한도 없이 forward-fill 하되(연속 그리드 유지), 첫 관측 이후 **연속 ffill 길이가
-    warn_run(일)을 초과**하면 '의심 데이터 갭'으로 보고한다. 정상 연휴(설/추석, 5~6일)는
-    통과하고, 소스 장애 같은 비정상 장기 결측만 경고하기 위함이다(CLAUDE.md §2.1 취지).
-    선두 결측(첫 관측 이전·상장 전 구간)은 ffill 대상이 아니며 갭으로 세지 않는다.
-
-    Returns:
-        (보간된 DataFrame, {컬럼: 한도초과 연속 ffill 최대길이})
+    2026-10-27 이전: 달력일에서 한도 없이 ffill 하고 warn_run 초과만 경고했다.
+    이후: warn_run 을 **한도**로 사용해 초과 구간은 NaN 유지 + gaps 반환.
     """
-    out = df.copy()
-    suspicious: dict[str, int] = {}
-    cols = [c for c in columns if c in out.columns]
-    for c in cols:
-        col = out[c]
-        filled = col.ffill()
-        first_valid = col.first_valid_index()
-        if first_valid is not None:
-            was_filled = col.isna() & filled.notna()
-            was_filled.loc[:first_valid] = False
-            run = _max_consecutive(was_filled)
-            if run > warn_run:
-                suspicious[c] = int(run)
-        out[c] = filled
-    return out, suspicious
+    out, gaps, _filled = ffill_limited(df, columns, limit=warn_run)
+    return out, gaps
 
 
 def _max_consecutive(mask: pd.Series) -> int:

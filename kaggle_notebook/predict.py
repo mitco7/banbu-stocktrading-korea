@@ -129,7 +129,17 @@ def get_stock_data_from_db():
         df.sort_values(by='날짜', inplace=True)
         df.reset_index(drop=True, inplace=True)
 
-        df = df.ffill().bfill()
+        # 레거시 달력일(주말) 행 제거. LOOKBACK/14는 영업일 행 기준(CLAUDE.md §2.1).
+        # 한국 휴장 평일은 수집기(market_calendar)에서 제외 — 잔존 시 소수.
+        before = len(df)
+        df = df[df['날짜'].dt.weekday < 5].copy()
+        df.reset_index(drop=True, inplace=True)
+        dropped_we = before - len(df)
+        if dropped_we:
+            print(f"  주말 행 제거: {dropped_we}개 (영업일 축)")
+
+        # ffill만 허용. bfill 금지(신상장 종목 상장 전 구간 look-ahead).
+        df = df.ffill()
 
         exclude_columns = ['날짜', 'id']
         numeric_columns = [col for col in df.columns if col not in exclude_columns]

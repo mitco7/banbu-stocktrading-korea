@@ -3,15 +3,17 @@
 흐름:
   collect_market_data(start, end)
     → 거시/시장 시계열 + 25종목 종가/거래량 수집(소스 폴백)
-    → 영업일 spine 에 outer-join 정렬
-    → 결측은 **ffill 만**(bfill 금지): 거시=발표일까지 ffill, 일간가격=연속 3일 한도
-    → 와이드 DataFrame(index=date) 반환
+    → **KRX 영업일 spine** 에 정렬(주말·휴장일 행 없음, CLAUDE.md §2.1)
+    → 결측은 **ffill 만**(bfill 금지): 거시=발표일까지 ffill, 일간 종가/지수=연속 3영업일 한도
+    → 거래량은 ffill 하지 않음(결측=NULL)
+    → 와이드 DataFrame(index=영업일) 반환
   save_market_data(df)
     → market_data 테이블에 멱등 저장(빈 컬럼만 채움)
 
 ⚠ look-ahead: 해외 시장 컬럼의 t-1 시프트와 거시 발표일 정렬은 ML 피처 빌더 책임이다.
-   본 수집기는 원본을 네이티브 날짜로 적재한다(상세: core.market_spec). 거래량은 ffill 하지 않는다
-   (휴장일 거래량을 전일치로 채우면 유동성을 날조하게 됨).
+   본 수집기는 원본을 네이티브 날짜로 적재한다(상세: core.market_spec).
+⚠ 기존 DB에 남아 있는 주말·휴장 행은 이 수집기가 삭제하지 않는다(upsert만).
+   정리 필요 시 별도 스크립트/SQL 로 비영업일 행을 제거한다.
 """
 
 from __future__ import annotations
@@ -23,9 +25,11 @@ import numpy as np
 import pandas as pd
 
 from core.config import settings
+from core.market_calendar import trading_day_range
 from core.market_spec import (
     ALL_DATA_COLUMNS,
     DATE_COL,
+    FFILL_LIMIT_BUSINESS_DAYS,
     FREQ_DAILY,
     FREQ_MONTHLY,
     FREQ_QUARTERLY,
@@ -36,7 +40,6 @@ from core.market_spec import (
     STOCK_CODES,
     STOCK_VOLUME_COLS,
     TIER_REQUIRED,
-    WARN_FFILL_RUN_DAYS,
     Series,
     stock_close_col,
     stock_volume_col,
@@ -45,8 +48,7 @@ from core.market_spec import (
 # 저빈도 지표: 발표 시차를 한 주기 보수 시프트하고, 구간 시작 경계를 채우려 조회를 앞당긴다.
 _SHIFT_FREQS = (FREQ_WEEKLY, FREQ_MONTHLY, FREQ_QUARTERLY)
 _SLOW_FETCH_LOOKBACK = pd.DateOffset(days=200)
-# 일간/종목: 구간 시작이 주말/공휴일일 때 선두 행을 직전 거래일 값으로 채우기 위한 버퍼
-# (구간 시작 전 거래일을 함께 수집 → ffill 후 실제 구간으로 잘라냄). KR 최장 연휴 커버.
+# 구간 첫 영업일의 소스 결측 시 직전 영업일 값을 ffill 한도 내로 끌어오기 위한 조회 버퍼.
 _LEADING_LOOKBACK = pd.DateOffset(days=20)
 
 # 증분 수집 관련.
@@ -60,7 +62,7 @@ from services.collectors.ecos_collector import fetch_ecos_series
 from services.collectors.fred_collector import fetch_fred_series
 from services.collectors.price_sources import fetch_price_series
 from services.collectors.stock_collector import fetch_stock
-from utils.dataframe import ffill_grid
+from utils.dataframe import ffill_limited
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -143,9 +145,11 @@ def collect_market_data(start: str, end: str,
                         missing_out: list[str] | None = None) -> pd.DataFrame:
     """[start, end] 구간 시장데이터 와이드 DataFrame 수집.
 
-    index = 달력일(date, 주말 포함), columns = ALL_DATA_COLUMNS. 결측은 ffill 규칙대로 처리됨.
-    주말/공휴일은 직전 거래일 값으로 ffill 연장된다(정답지 방식). 구간 시작이 주말/공휴일이어도
-    선두 행이 비지 않도록, 일간/종목을 구간 시작 전 버퍼까지 수집해 채운 뒤 실제 구간으로 잘라낸다.
+    index = **KRX 영업일**(주말·휴장 제외), columns = ALL_DATA_COLUMNS.
+    결측은 영업일 그리드 위 ffill 규칙(일간 종가/지수: 최대 FFILL_LIMIT_BUSINESS_DAYS,
+    거래량: ffill 안 함, 거시: 한도 없이 발표일 유지).
+    구간 첫 영업일의 소스 결측을 한도 내로 메우려 선두 버퍼 영업일까지 수집한 뒤
+    실제 [start, end] 영업일만 잘라 반환한다.
 
     missing_out: 리스트를 주면 '필수(TIER_REQUIRED) 일간 지표인데 모든 소스가 실패/신선도 미달'인
       컬럼명을 담아 돌려준다. 호출자(파이프라인)가 fail-close 판단에 쓴다.
@@ -155,9 +159,14 @@ def collect_market_data(start: str, end: str,
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
     if end_ts < start_ts:
         raise ValueError(f"빈 날짜 구간: {start} ~ {end}")
-    # 확장 그리드(선두 채움용 버퍼 포함). 마지막에 [start, end] 로 잘라낸다.
+    # 확장 영업일 그리드(선두 채움용 버퍼 포함). 마지막에 [start, end] 영업일로 잘라낸다.
     ext_start = (start_ts - _LEADING_LOOKBACK).strftime("%Y-%m-%d")
-    spine = pd.date_range(start=ext_start, end=end_ts, freq="D")
+    spine = trading_day_range(ext_start, end_ts)
+    if spine.empty:
+        logger.warning("영업일 spine 비어 있음: %s ~ %s", start, end)
+        empty = pd.DataFrame(columns=ALL_DATA_COLUMNS, dtype="float64")
+        empty.index.name = DATE_COL
+        return empty
     frame = pd.DataFrame(index=spine, dtype="float64")
 
     daily_market_cols: list[str] = []
@@ -180,10 +189,10 @@ def collect_market_data(start: str, end: str,
                 missing_out.append(series.key)
             frame[series.key] = np.nan
         elif series.freq == FREQ_DAILY:
-            # 일간: 거래일 값을 달력일 그리드에 정렬(이후 ffill_grid 로 주말/공휴일·선두 연장).
+            # 일간: 소스 거래일 값을 영업일 spine 에 정렬(이후 한도 ffill).
             frame[series.key] = s.reindex(spine).astype("float64")
         else:
-            # 저빈도(주/월/분기/비정기): 직전 값을 끌어와 채운다(method="ffill").
+            # 저빈도(주/월/분기/비정기): 직전 값을 영업일에 끌어와 채운다.
             frame[series.key] = s.reindex(spine, method="ffill").astype("float64")
         (daily_market_cols if series.freq == FREQ_DAILY else slow_cols).append(
             series.key
@@ -199,26 +208,29 @@ def collect_market_data(start: str, end: str,
             failed_stocks.append(code)
         else:
             frame[stock_close_col(code)] = df["close"].reindex(spine).astype("float64")
+            # 거래량: reindex 만 — ffill 금지(당일 실측).
             frame[stock_volume_col(code)] = (
                 pd.to_numeric(df["volume"], errors="coerce").reindex(spine).astype("float64")
             )
     if failed_stocks:
         logger.warning("종목 수집 실패: %s", ", ".join(failed_stocks))
 
-    # ── 결측 처리 (ffill 전용, 달력일 그리드 연속 채움) ──────
+    # ── 결측 처리 (ffill 전용, 영업일 그리드·한도) ──────
     # 저빈도(거시)는 위에서 reindex(method="ffill")로 이미 연속 채워짐.
-    # 일간 가격·종목 종가·거래량: 주말/공휴일·선두를 직전 거래일 값으로 연속 ffill.
-    #   (버퍼 구간의 직전 거래일에서 끌어오므로 구간 첫 주말도 채워진다.)
-    fill_cols = daily_market_cols + STOCK_CLOSE_COLS + STOCK_VOLUME_COLS
-    frame, suspicious = ffill_grid(frame, fill_cols, WARN_FFILL_RUN_DAYS)
-    if suspicious:
+    # 일간 지수/환율·종목 종가만 한도 ffill. 거래량은 제외.
+    fill_cols = daily_market_cols + STOCK_CLOSE_COLS
+    frame, gaps, _filled = ffill_limited(
+        frame, fill_cols, limit=FFILL_LIMIT_BUSINESS_DAYS
+    )
+    if gaps:
         logger.warning(
-            "의심 데이터 갭(연속 %d일 초과 ffill — 정상 연휴 아님): %s",
-            WARN_FFILL_RUN_DAYS, suspicious,
+            "데이터 갭(연속 %d영업일 초과 ffill 한도 — NaN 유지): %s",
+            FFILL_LIMIT_BUSINESS_DAYS, gaps,
         )
 
-    # 버퍼 구간 제거 → 실제 [start, end] 만 반환.
-    frame = frame.loc[start_ts:end_ts]
+    # 버퍼 구간 제거 → 실제 [start, end] 영업일만 반환.
+    out_index = trading_day_range(start_ts, end_ts)
+    frame = frame.reindex(out_index)
     frame = frame.reindex(columns=ALL_DATA_COLUMNS).astype("float64")
     frame.index.name = DATE_COL
     return frame
@@ -313,7 +325,7 @@ def update_market_data(force: bool = False) -> dict:
 
     - 장중(KST 평일 09:00~15:30)에는 당일 종가가 미확정이므로 당일을 포함하지 않는다(어제까지).
       force=True 면 당일까지 포함.
-    - 멱등: 여러 번 돌려도 중복 없음(빈 컬럼만 채우는 upsert + 달력일 ffill).
+    - 멱등: 여러 번 돌려도 중복 없음(빈 컬럼만 채우는 upsert + 영업일 ffill).
     - 안전장치: 증분 범위가 과도하면(초기적재/RLS 빈응답 의심) force 없이는 수집하지 않는다.
     """
     now = datetime.now(KST)

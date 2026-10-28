@@ -65,7 +65,7 @@ banbu-stocktrading-korea/
 │   │   ├── flow_collector.py       # 외국인/기관 수급
 │   │   └── universe_selector.py    # 시총·거래대금 상위 25 후보 산출(수동 승인용)
 │   ├── indicators/
-│   │   ├── technical.py            # SMA, RSI, MACD, ATR, ADX, 거래량비율, 골든크로스
+│   │   ├── technical.py            # SMA, RSI, MACD, ATR, ADX, 거래량비율,  골든크로스
 │   │   └── flow_score.py           # 수급 점수 (-1~+1)
 │   ├── ml/
 │   │   ├── predictor.py            # 학습된 가중치 로드 + 일일 추론
@@ -306,8 +306,13 @@ banbu-stocktrading-korea/
 ## 5. 주요 설계 원칙
 
 ### 5.1 데이터 무결성
-- **결측치 처리는 ffill(전일치 보간)만 허용**. 평균/중앙값/랜덤 보간 금지.
-- ffill 적용 시 **연속 ffill 일수 제한**(예: 최대 3일)을 두고, 초과 시 데이터 갭으로 분류 + Slack 알림.
+- **날짜 축 = KRX 영업일만** (`core/market_calendar`). 주말·한국 휴장일 행은 저장하지 않는다.
+  비영업일을 달력 그리드로 만들어 ffill 연장하는 방식은 쓰지 않는다(CLAUDE.md §2.1, 2026-10-27 개정).
+- **결측치 처리는 ffill(직전 영업일 값 보간)만 허용**. 평균/중앙값/랜덤/`bfill` 금지.
+- ffill은 영업일 그리드 위에서 소스 결측·해외 휴장 등으로 빈 칸에만 적용.
+  **연속 ffill 한도(예: 최대 3영업일)** 초과 시 데이터 갭 + Slack 알림.
+- 거래량 등 당일 실측 컬럼은 결측 시 NULL(ffill 금지).
+- ML LOOKBACK·14일 horizon은 영업일 행 기준.
 - 모든 외부 API 응답은 원본을 보존(`raw_response` JSONB 컬럼 또는 별도 저장).
 
 ### 5.2 안전 우선 거래
